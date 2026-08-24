@@ -1,0 +1,376 @@
+#%% md
+# Solutions — Notebook 0: One dataset, three representations
+
+**ML Summer School · Large models · Lecture 2**
+
+---
+
+Worked solutions to the four exercises at the end of Notebook 0, with the numbers
+we measured when we ran them.
+
+Two things to say before you read on.
+
+**Your numbers will differ in the last digit and that is fine.** Every result
+here is one training run, which is one sample from a distribution. What should
+reproduce is the *direction* and the *order of magnitude* of each effect, not the
+third decimal place.
+
+**Some of these exercises do not have the answer you expect.** Exercise 2 in
+particular ends somewhere more interesting than "the MLP needs more data".
+
+**Runtime:** roughly 8–12 minutes on a Colab T4.
+
+#%% md
+## Setup
+
+The same scaffolding as Notebook 0, condensed into one cell: the kink dataset,
+the two models, a training loop and an accuracy function.
+
+#%% setup
+
+#%% code
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+torch.manual_seed(0)
+np.random.seed(0)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("torch", torch.__version__, "| device:", DEVICE)
+
+
+def prepare(ds, pixel_perm=None):
+    """(N,1,H,W) normalised per event, optionally with pixels permuted."""
+    x = torch.tensor(ds["image"])[:, None]
+    x = x / x.amax(dim=(1, 2, 3), keepdim=True).clamp(min=1e-6)
+    if pixel_perm is not None:
+        shape = x.shape
+        x = x.reshape(len(x), -1)[:, pixel_perm].reshape(shape)
+    return x, torch.tensor(ds["label"])
+
+
+def make_mlp():
+    return nn.Sequential(nn.Flatten(),
+                         nn.Linear(ms.SIZE * ms.SIZE, 256), nn.ReLU(),
+                         nn.Linear(256, 128), nn.ReLU(),
+                         nn.Linear(128, 2))
+
+
+def conv_block(cin, cout):
+    return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1), nn.ReLU(),
+                         nn.Conv2d(cout, cout, 3, padding=1), nn.ReLU(),
+                         nn.MaxPool2d(2))
+
+
+def make_cnn(head="global_max"):
+    body = [conv_block(1, 16), conv_block(16, 32)]
+    if head == "global_max":
+        return nn.Sequential(*body, nn.AdaptiveMaxPool2d(1), nn.Flatten(),
+                             nn.Linear(32, 2))
+    # exercise 4: keep every position instead of pooling it away
+    side = ms.SIZE // 4
+    return nn.Sequential(*body, nn.Flatten(), nn.Linear(32 * side * side, 2))
+
+
+def shift_batch(xb, max_shift):
+    out = torch.empty_like(xb)
+    dx = torch.randint(-max_shift, max_shift + 1, (len(xb),))
+    dy = torch.randint(-max_shift, max_shift + 1, (len(xb),))
+    for k in range(len(xb)):
+        out[k] = torch.roll(xb[k], shifts=(int(dy[k]), int(dx[k])), dims=(1, 2))
+    return out
+
+
+def fit(model, X, Y, epochs=8, bs=128, lr=1e-3, augment=0, seed=0):
+    torch.manual_seed(seed)
+    model = model.to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(len(X))
+        for i in range(0, len(perm), bs):
+            b = perm[i:i + bs]
+            xb = shift_batch(X[b], augment) if augment else X[b]
+            opt.zero_grad()
+            F.cross_entropy(model(xb.to(DEVICE)), Y[b].to(DEVICE)).backward()
+            opt.step()
+    return model
+
+
+@torch.no_grad()
+def accuracy(model, X, Y, bs=512):
+    model.eval()
+    return sum((model(X[i:i + bs].to(DEVICE)).argmax(1).cpu() == Y[i:i + bs]).sum().item()
+               for i in range(0, len(X), bs)) / len(X)
+
+
+def n_params(m):
+    return sum(p.numel() for p in m.parameters())
+
+
+train_c = ms.generate_kink_dataset(6000, seed=1, jitter=6)    # centred
+val_c   = ms.generate_kink_dataset(1500, seed=2, jitter=6)    # centred
+test_s  = ms.generate_kink_dataset(1500, seed=4, jitter=30)   # shifted
+print("datasets ready")
+
+#%% md
+## Exercise 1 — Permute the pixels
+
+> Apply one fixed random permutation to every image (train and test alike) and
+> retrain both models. The MLP's accuracy should be unchanged — it never used
+> the geometry. The CNN's should be destroyed.
+
+A fixed permutation is a bijection on pixel indices. It destroys *adjacency* —
+which pixels are neighbours — while preserving the multiset of pixel values and
+the identity of each pixel as an input feature.
+
+That distinction is exactly the dividing line between the two models. An MLP has
+one weight per (pixel, unit) pair, so permuting the pixels permutes the columns
+of its first weight matrix; it can learn the permuted problem exactly as well
+because it is the *same* problem to a model with no notion of locality. A CNN
+reads a $3\times3$ neighbourhood, and after permutation those nine pixels are
+nine unrelated positions scattered across the detector.
+
+#%% code
+g = torch.Generator().manual_seed(0)
+pixel_perm = torch.randperm(ms.SIZE * ms.SIZE, generator=g)
+
+rows = []
+for tag, perm in [("original", None), ("permuted", pixel_perm)]:
+    Xt, Yt = prepare(train_c, perm)
+    Xv, Yv = prepare(val_c, perm)
+    for name, factory in [("MLP", make_mlp), ("CNN", make_cnn)]:
+        acc = accuracy(fit(factory(), Xt, Yt), Xv, Yv)
+        rows.append((tag, name, acc))
+        print(f"  {tag:<10}{name}  val accuracy {acc:.3f}")
+
+fig, ax = plt.subplots(figsize=(5.4, 3.4))
+for k, name in enumerate(["MLP", "CNN"]):
+    vals = [r[2] for r in rows if r[1] == name]
+    ax.bar([k - 0.18, k + 0.18], vals, width=0.34,
+           color=["#4cc9f0", "#ef476f"], edgecolor="k", lw=0.6)
+ax.set_xticks([0, 1]); ax.set_xticklabels(["MLP", "CNN"])
+ax.axhline(0.5, ls=":", c="grey"); ax.set_ylabel("validation accuracy")
+ax.set_title("blue = original pixels, red = permuted", fontsize=10)
+ax.set_ylim(0.4, 1.05); plt.show()
+
+#%% md
+### What we measured
+
+| model | original pixels | permuted pixels |
+|---|---|---|
+| MLP | 0.924 | **0.925** |
+| CNN | 0.999 | **0.569** |
+
+The MLP is *completely* unaffected — it does marginally better on the permuted
+data, which is noise. The CNN collapses to near chance.
+
+This is the cleanest possible statement of what "using the geometry" means.
+Permuting the pixels is a transformation under which the MLP's hypothesis space
+is exactly invariant, and under which the CNN's prior becomes actively wrong: it
+is still assuming that neighbouring array entries are physically adjacent, and
+that assumption is now false.
+
+It also reframes the headline result of Notebook 0. The CNN did not beat the MLP
+because it is a better function approximator. It won because it was told
+something true about the data, and here we have taken that truth away and watched
+the advantage evaporate. **An inductive bias is only an advantage when it is
+correct** — which is why the first question about any architecture is what it
+assumes, not how well it scores.
+
+## Exercise 2 — How much data does the MLP need?
+
+> How much data does the MLP need to survive a shift of 30 pixels? Retrain it
+> with `jitter=30` in the *training* set and increase the training set size.
+> Does it get there? At what cost?
+
+Note what changed: we are no longer asking the MLP to generalise to shifts it
+never saw. We now *train* it on shifted events, so the shifts are in
+distribution. This is the fairest possible version of the question — we are
+asking how expensive it is to *learn* translation invariance rather than to
+assume it.
+
+#%% code
+big = ms.generate_kink_dataset(24000, seed=7, jitter=30)
+Xb, Yb = prepare(big)
+Xe, Ye = prepare(test_s)
+
+sizes = [1500, 3000, 6000, 12000, 24000]
+mlp_curve = []
+for n in sizes:
+    acc = accuracy(fit(make_mlp(), Xb[:n], Yb[:n], epochs=12), Xe, Ye)
+    mlp_curve.append(acc)
+    print(f"  MLP, {n:>6,} shifted training events -> shifted test accuracy {acc:.3f}")
+
+cnn_small = accuracy(fit(make_cnn(), Xb[:1500], Yb[:1500], epochs=12), Xe, Ye)
+print(f"\n  CNN, {1500:>6,} shifted training events -> shifted test accuracy "
+      f"{cnn_small:.3f}")
+
+fig, ax = plt.subplots(figsize=(6.2, 3.8))
+ax.semilogx(sizes, mlp_curve, "o-", label="MLP (2.4 M params)")
+ax.axhline(cnn_small, color="#f7b32b", ls="--",
+           label=f"CNN with only 1500 events ({cnn_small:.2f})")
+ax.axhline(0.5, ls=":", c="grey")
+ax.set_xlabel("training events (all shifted, jitter = 30 px)")
+ax.set_ylabel("accuracy on shifted test set")
+ax.set_ylim(0.45, 1.05); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.show()
+
+#%% md
+### What we measured
+
+| training events | MLP accuracy |
+|---|---|
+| 1 500 | 0.511 |
+| 3 000 | 0.543 |
+| 6 000 | 0.559 |
+| 12 000 | 0.616 |
+| 24 000 | 0.738 |
+
+and the CNN, trained on **1 500** of the same shifted events: **0.977**.
+
+**The honest answer to "does it get there?" is no.** Sixteen times more data
+moves the MLP from chance to 0.74, and the curve is still climbing slowly — a
+rough extrapolation suggests you would need on the order of $10^5$–$10^6$ events
+to approach what the CNN achieves with 1 500. We stopped at 24 000 because the
+point was already made.
+
+**The cost is worth stating in three currencies:**
+
+- **Data.** More than an order of magnitude, and quite possibly two.
+- **Compute.** Every one of those events must be generated and passed through a
+  2.4 M-parameter network, repeatedly.
+- **Coverage.** The MLP is learning translation invariance *by enumeration* — it
+  must see kinks at enough positions to interpolate the rest. That works for a
+  2-parameter shift group. It does not scale to rotations, or to a detector with
+  a million channels, and it gives you no guarantee about positions that happen
+  to be under-represented in your training sample.
+
+The CNN pays none of this because it never had to learn the invariance: weight
+sharing means a kink at the corner and a kink at the centre are, to the network,
+*the same input pattern*. That is what "encoding structure as a prior" buys you,
+priced in events.
+
+## Exercise 3 — Augmentation as a poor person's inductive bias
+
+> Keep the MLP, keep `jitter=6` for training, but randomly translate each image
+> during training. How close to the CNN can you get? What did you have to pay?
+
+Now we inject the symmetry through the *data* instead of the architecture. The
+training events are still centred; we translate them on the fly, so the model
+sees the same physics at many positions.
+
+#%% code
+Xt, Yt = prepare(train_c)
+aug_curve = []
+for shift in (0, 6, 12, 24, 32):
+    t0 = time.time()
+    acc = accuracy(fit(make_mlp(), Xt, Yt, epochs=12, augment=shift), Xe, Ye)
+    aug_curve.append(acc)
+    print(f"  MLP + random shift of +-{shift:>2} px  ->  shifted test accuracy "
+          f"{acc:.3f}   ({time.time() - t0:.0f} s)")
+
+fig, ax = plt.subplots(figsize=(6.2, 3.8))
+ax.plot([0, 6, 12, 24, 32], aug_curve, "o-", label="MLP + augmentation")
+ax.axhline(cnn_small, color="#f7b32b", ls="--", label="CNN (architectural)")
+ax.axhline(0.5, ls=":", c="grey")
+ax.set_xlabel("augmentation range [pixels]"); ax.set_ylabel("shifted test accuracy")
+ax.set_ylim(0.45, 1.05); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.show()
+
+#%% md
+### What we measured
+
+| augmentation range | shifted test accuracy |
+|---|---|
+| none | 0.542 |
+| ±6 px | 0.599 |
+| ±12 px | 0.665 |
+| ±24 px | **0.858** |
+| ±32 px | 0.850 |
+
+Augmentation takes the MLP from chance to 0.86 using the *same 6 000 centred
+events* — far better value than the 24 000 shifted events in exercise 2, which
+only reached 0.74. Encoding the symmetry as a data transformation is much more
+efficient than hoping to sample it.
+
+But it does not close the gap to the CNN's 0.98–1.00, and the shape of the curve
+tells you why. **The augmentation range has to match the shift you will face.**
+At ±6 px the model learns invariance over a 6-pixel neighbourhood and remains
+lost at 30; you only get most of the way there once the augmentation range covers
+the test-time displacement. In other words you had to *know the answer* — the
+size of the shift — in order to choose the augmentation. The CNN needed no such
+knowledge.
+
+**What you paid:**
+
+- **You must know which transformation to apply, and over what range.** Guess the
+  range too small and you buy nothing.
+- **Effective dataset difficulty goes up**, so you need more epochs or more
+  capacity to fit the harder, augmented distribution.
+- **The invariance is approximate and learned**, so it holds only where you
+  sampled it, with no guarantee at the edges.
+
+Compare with the CNN: exact by construction (up to the aliasing we measured in
+§5 of the notebook), free, and it needed no prior knowledge of the shift range.
+
+**Use both in practice.** Architecture for the symmetries you can build in;
+augmentation for the ones that are awkward to build in — realistic noise, gain
+drift, dead channels — where an approximate, learned invariance is the only
+option available.
+
+## Exercise 4 — Break the CNN
+
+> Replace the global max-pool with `nn.Flatten()` over the final feature map.
+> You have just reintroduced position dependence. Predict what the shifted-test
+> column will do, then check.
+
+The convolutional *body* is still translation equivariant: shift the input and
+the feature map shifts with it. What global max-pooling did was collapse that
+equivariance into invariance — "did this detector fire anywhere?" — by throwing
+the position away.
+
+Flattening keeps every position as a separate input to the classifier, so the
+final linear layer once again has a private weight for each location. It is an
+MLP bolted onto convolutional features.
+
+#%% code
+Xt, Yt = prepare(train_c)
+Xv, Yv = prepare(val_c)
+
+print(f"{'head':<18}{'params':>10}{'centred val':>14}{'shifted test':>15}")
+print("-" * 57)
+for tag, head in [("global max-pool", "global_max"), ("flatten", "flatten")]:
+    model = fit(make_cnn(head), Xt, Yt)
+    print(f"{tag:<18}{n_params(model):>10,}{accuracy(model, Xv, Yv):>14.3f}"
+          f"{accuracy(model, Xe, Ye):>15.3f}")
+
+#%% md
+### What we measured
+
+| head | parameters | centred val | shifted test |
+|---|---|---|---|
+| global max-pool | 16 434 | 0.999 | **0.999** |
+| flatten | 53 234 | 0.959 | **0.548** |
+
+The prediction holds. Flattening costs almost nothing on centred events (0.96 vs
+1.00), triples the parameter count, and destroys the model on shifted ones — back to chance, exactly like the
+MLP in the main notebook.
+
+Two things worth extracting:
+
+**The convolutional layers were never the source of the invariance.** They give
+you *equivariance*; the pooling is what converts it into *invariance*. If you
+take one thing from this exercise, take that distinction — it is the same one
+Lecture 4 builds on, and it is routinely garbled.
+
+**The failure is invisible on the validation set.** 0.960 on centred data is a
+perfectly respectable number, and a standard random train/validation split would
+have reported it and told you nothing else. The defect only appears when you test
+the thing you claim to be invariant to. That is the habit this whole notebook is
+trying to install: **for every symmetry you believe your problem has, build an
+evaluation that applies the transformation and checks the answer does not move.**

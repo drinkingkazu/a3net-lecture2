@@ -1,0 +1,712 @@
+#%% md
+# Lecture 2 · Notebook 0 — One dataset, three representations
+
+**ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
+
+---
+
+### Where we are
+
+The previous lecture gave you linear models and the statistical-learning frame:
+a hypothesis space, a loss, an optimiser, and a bias–variance trade-off. It also
+gave you an unsettling theorem — the **universal approximation theorem** — which
+says a sufficiently wide multi-layer perceptron (MLP) can approximate any
+continuous function to any accuracy you like.
+
+Read literally, that theorem ends this lecture before it starts. If an MLP can
+represent anything, why does anyone build a convolutional network?
+
+The answer is the single most important idea in this lecture, so here it is up
+front:
+
+> **Representability is not the problem. Optimisability is.**
+>
+> The universal approximation theorem says a good solution *exists* somewhere in
+> the hypothesis space. It says nothing about whether stochastic gradient
+> descent, starting from a random initialisation and given the finite data you
+> actually have, will *find* it.
+>
+> An architecture is not a way of making new functions possible. It is a way of
+> making the useful functions **easy to find** — by shrinking the hypothesis
+> space to one that mostly contains sensible answers. That shrinking is called
+> an **inductive bias**.
+
+This notebook establishes that claim experimentally, and introduces the dataset
+we will use for the entire lecture.
+
+### What you will do
+
+1. Meet the data: simulated particle interactions in a liquid-argon detector.
+2. Practise **Rule 0** — look at your data and count things — before modelling.
+3. Count parameters, and see why "just use a big MLP" is not a plan.
+4. Run the headline experiment: an MLP with 2.4 M parameters against a CNN with
+   16 k, on a task designed so that *only shape* can solve it.
+5. Watch the CNN's translation invariance break down at the image border — the
+   opening for Lecture 4.
+6. See the same event as a **dense image**, a **sparse coordinate list**, and a
+   **point cloud**, and count the cost of each.
+
+**Runtime:** roughly 5–8 minutes on a Colab T4. Set *Runtime → Change runtime
+type → GPU* before you start; it will still run on CPU, just slower.
+
+#%% md
+## 0. Setup
+
+The cell below clones the course repository and installs it. Run it once per
+session; it is safe to re-run and does nothing if `mlschool` is already
+available. Everything the notebooks share — the detector simulator, plotting,
+metrics and training boilerplate — lives in that package, so the code you read
+below is only the code that carries an idea.
+
+#%% setup
+
+#%% code
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("torch", torch.__version__, "| device:", DEVICE)
+if DEVICE == "cpu":
+    print("No GPU found. Everything still runs, roughly 5x slower.")
+
+#%% md
+## 1. The detector and the data
+
+Our data is a cartoon of a **liquid-argon time projection chamber** (LArTPC) —
+the detector technology behind MicroBooNE, ICARUS, and the forthcoming DUNE.
+A charged particle traversing the argon ionises it; the ionisation charge drifts
+to a readout plane and is recorded. What you get out is, to a good
+approximation, a **picture of the event**.
+
+Two signatures dominate, and telling them apart is a real and central task in
+neutrino physics:
+
+| | appearance | physics |
+|---|---|---|
+| **track** | thin, continuous, roughly constant charge per unit length, with a sharp **Bragg peak** where the particle stops | muons, protons, charged pions |
+| **shower** | a cone that starts at the interaction vertex and widens with depth; diffuse and stochastic | electrons and photons initiating an electromagnetic cascade |
+
+On top of that sits a sprinkling of uncorrelated **noise hits**, which are not
+signal and must be ignored.
+
+We simulate three event classes — *track only*, *shower only*, and
+*track + shower* (the topology of an electron-neutrino charged-current
+interaction) — and provide three labels per event:
+
+- `label` — the event class (3-way classification)
+- `seg` — a **per-pixel** semantic label: background / track / shower (segmentation)
+- `energy` — total true deposited charge (regression)
+
+One dataset, three tasks, one shared encoder. That is the structure of Notebook 1.
+
+#%% code
+t0 = time.time()
+events = ms.generate_dataset(4000, seed=0, progress=True)
+print(f"generated 4000 events in {time.time() - t0:.1f} s")
+
+fig = ms.plot_grid(events, idx=[int(np.where(events["label"] == c)[0][k])
+                               for c in range(3) for k in range(2)])
+plt.show()
+
+#%% md
+Top row: the charge image, which is what the detector gives you. Bottom row: the
+per-pixel truth labels, which only simulation gives you. Note the bright pixel at
+the end of each track — that is the Bragg peak, and it is a genuine physical
+handle on where a particle stopped.
+
+## 2. Rule 0: look at your data, and count things
+
+Before you choose an architecture, before you write a training loop, before you
+do anything at all: **print the numbers**. Every hour of the debugging that
+awaits you in Notebook 2 is an hour you could have saved here.
+
+The four numbers that matter most:
+
+1. **Dynamic range of the inputs.** Neural networks are badly behaved when fed
+   inputs of order 100. You will normalise these — and in Notebook 2 you will
+   see exactly what happens when you forget.
+2. **Occupancy.** What fraction of pixels are non-zero? This single number
+   decides whether a dense convolution is a sensible use of your GPU.
+3. **Class balance**, at both the event and the pixel level. A task where 98 %
+   of the answers are "background" has a trivial degenerate optimum that your
+   loss function will happily find.
+4. **Memory.** How big is one batch, really?
+
+#%% code
+ms.summarize(events, "3-class dataset")
+
+#%% md
+Three of those numbers should stop you:
+
+- **Charge runs from 0 to ~140.** Feed that straight into a network with
+  standard initialisation and the first layer's pre-activations will be enormous.
+- **Occupancy is ~2.5 %.** A dense convolution over this image spends about
+  **97.5 % of its arithmetic multiplying zeros by weights.** Hold on to that
+  number; it is the entire motivation for Notebook 3.
+- **Pixel classes are ~98 % background.** A segmentation model that predicts
+  "background" everywhere achieves 98 % pixel accuracy and is completely
+  useless. This is why *accuracy* is the wrong metric and why the choice of loss
+  is a modelling decision, not a formality — Notebook 1.
+
+## 3. Why not just use a big MLP?
+
+Let us take the universal approximation theorem at its word and price it out.
+
+An MLP takes the image as a flat vector of $96 \times 96 = 9216$ numbers. Its
+first layer has one weight per (input pixel, hidden unit) pair. A convolutional
+layer instead **shares** one small kernel across every position in the image.
+
+#%% code
+H = W = ms.SIZE
+n_pixels = H * W
+
+mlp_first  = n_pixels * 256 + 256          # Linear(9216 -> 256)
+conv_first = 1 * 16 * 3 * 3 + 16           # Conv2d(1 -> 16, kernel 3x3)
+
+print(f"image                        {H} x {W} = {n_pixels} pixels")
+print(f"MLP  first layer (-> 256)    {mlp_first:>12,} parameters")
+print(f"Conv first layer (1->16, 3x3){conv_first:>12,} parameters")
+print(f"ratio                        {mlp_first / conv_first:>12,.0f} x")
+print()
+print("and if the detector doubles in linear size:")
+for size in (96, 192, 384, 768):
+    print(f"  {size:>4} x {size:<4}  MLP first layer = {size * size * 256 + 256:>12,}"
+          f"   conv kernel = {conv_first:>6,}")
+
+#%% md
+The conv kernel's parameter count **does not depend on the image size at all**.
+The MLP's grows quadratically. For a real DUNE readout plane the MLP first layer
+alone would have billions of parameters.
+
+But parameter count is the *shallow* version of the argument, and if you stop
+there a student will reasonably reply: "fine, so it's expensive — buy more
+GPUs." The deep version of the argument is about what those parameters
+*generalise to*, and that needs an experiment.
+
+## 4. Designing an experiment that measures the right thing
+
+We want to ask: *does an MLP learn the shape of an event, or does it learn where
+the bright pixels happen to be?*
+
+The obvious experiment is to train on events near the image centre and test on
+events shifted away from it. But run that on our 3-class dataset and we would be
+fooling ourselves. Look again at the summary above: a shower deposits far more
+charge over far more pixels than a track. So **total charge alone nearly gives
+the class away** — and total charge is translation invariant. A model could
+score beautifully on shifted images having learned nothing whatsoever about
+shape, and we would draw exactly the wrong conclusion.
+
+This is an ordinary experimental-design problem and you already know how to
+handle it: **remove the confound by construction.**
+
+So for this one experiment we use a controlled sample from the same simulator:
+
+- **class 0 — straight:** one track of fixed total length
+- **class 1 — kink:** two tracks of the same *combined* length meeting at a vertex
+
+Both classes are built with the same total track length, the same charge per unit
+length, and the centre of charge placed at the same distribution of positions.
+We also switch off the Bragg peak, because a two-armed event would otherwise have
+two bright endpoints and a one-armed event one — another position-free giveaway.
+
+Hit count and total charge therefore carry no class information. The only usable
+signal is **shape**. Physically the task is a fair one: distinguishing a muon
+that passed through from one that scattered hard or decayed in flight.
+
+#%% code
+kink_train = ms.generate_kink_dataset(6000, seed=1, jitter=6)    # centred events
+kink_val   = ms.generate_kink_dataset(1500, seed=2, jitter=6)    # centred events
+kink_test  = ms.generate_kink_dataset(1500, seed=4, jitter=30)   # shifted events
+
+idx = [int(np.where(kink_train["label"] == c)[0][k]) for c in range(2) for k in range(4)]
+fig, axes = plt.subplots(2, 4, figsize=(9, 4.8))
+for ax, i in zip(axes.ravel(), idx):
+    ms.plot_event(kink_train, i, ax, "charge", title=ms.KINK_NAMES[kink_train["label"][i]])
+fig.suptitle("training sample: events sit near the centre", y=1.02)
+fig.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(1, 4, figsize=(9, 2.6))
+for ax, i in zip(axes, range(4)):
+    ms.plot_event(kink_test, i, ax, "charge", title=ms.KINK_NAMES[kink_test["label"][i]])
+fig.suptitle("test sample: same physics, moved elsewhere in the detector", y=1.05)
+fig.tight_layout(); plt.show()
+
+#%% md
+Now verify the confound is actually gone, rather than assuming it. We fit a
+logistic regression on nothing but global, position-free summary statistics — if
+*that* can classify the events, our experiment is worthless.
+
+#%% code
+_ = ms.check_shortcuts(kink_train)
+
+#%% md
+Around 0.53 against a chance level of 0.50. Essentially nothing. Good — any model
+that does well here has to be using shape.
+
+> **Habit worth forming.** Every time you build a discrimination task, ask what
+> the dumbest possible cheat is, and *measure* whether it works. In physics the
+> cheat is usually a difference in event rate, exposure, or preprocessing between
+> your two samples, and it will happily produce a beautiful, meaningless ROC curve.
+
+## 5. Two models
+
+**The MLP** flattens the image and learns a weight for every pixel. Nothing in
+its structure says that pixel $(40, 40)$ and pixel $(41, 40)$ are neighbours; you
+could permute all 9216 pixels with a fixed random permutation and the MLP would
+train exactly as well. It does not know the image is an image.
+
+**The CNN** makes two structural assumptions, and they are assumptions about
+*physics*, not about software:
+
+1. **Locality** — what matters at a point is decided by its neighbourhood. True
+   here: ionisation is deposited locally.
+2. **Translation equivariance (weight sharing)** — a kink is a kink wherever it
+   occurs. Also true here: the detector response does not depend on where in the
+   volume the interaction happened.
+
+We then finish the CNN with a **global max-pool**, which turns equivariance
+("where is the kink?") into invariance ("is there a kink at all?"). Note *max*,
+not *mean* — we come back to that choice below, and it matters more than you
+would guess.
+
+#%% code
+def make_mlp():
+    """Flatten and forget the geometry."""
+    return nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(ms.SIZE * ms.SIZE, 256), nn.ReLU(),
+        nn.Linear(256, 128), nn.ReLU(),
+        nn.Linear(128, 2),
+    )
+
+
+def conv_block(cin, cout):
+    return nn.Sequential(
+        nn.Conv2d(cin, cout, 3, padding=1), nn.ReLU(),
+        nn.Conv2d(cout, cout, 3, padding=1), nn.ReLU(),
+        nn.MaxPool2d(2),
+    )
+
+
+def make_cnn(pool=nn.AdaptiveMaxPool2d):
+    """Local feature detectors + 'did it fire anywhere?'."""
+    return nn.Sequential(
+        conv_block(1, 16),
+        conv_block(16, 32),
+        pool(1), nn.Flatten(),
+        nn.Linear(32, 2),
+    )
+
+
+def n_params(m):
+    return sum(p.numel() for p in m.parameters())
+
+
+print(f"MLP parameters: {n_params(make_mlp()):>10,}")
+print(f"CNN parameters: {n_params(make_cnn()):>10,}")
+print(f"the MLP is {n_params(make_mlp()) / n_params(make_cnn()):.0f}x larger")
+
+#%% md
+### Preparing the inputs
+
+Two things happen here, and both are deliberate.
+
+We add a **channel dimension** — PyTorch convolutions expect
+`(batch, channels, height, width)`. Our detector has one readout plane, so one
+channel; a real LArTPC has three, and they would go here.
+
+We then divide each event by its own maximum charge, so every image lands in
+$[0, 1]$. This is input normalisation, and it does two jobs: it keeps the
+pre-activations in a sane range, and it removes the last vestige of an
+amplitude-based shortcut. In Notebook 2 you will see a training run where this
+line was left out.
+
+#%% code
+def prepare(ds):
+    # [:, None] inserts the channel axis PyTorch convolutions expect:
+    # (N, H, W) -> (N, 1, H, W). One channel = one readout plane.
+    x = torch.tensor(ds["image"])[:, None]                     # (N, 1, H, W)
+    # amax over (channel, height, width) with keepdim gives (N, 1, 1, 1), which
+    # broadcasts back over the image: each event divided by its OWN maximum.
+    # clamp guards the (impossible here, but cheap) all-zero event.
+    x = x / x.amax(dim=(1, 2, 3), keepdim=True).clamp(min=1e-6)
+    return x, torch.tensor(ds["label"])
+
+
+Xtr, Ytr = prepare(kink_train)
+Xva, Yva = prepare(kink_val)
+Xte, Yte = prepare(kink_test)
+print("input batch shape:", Xtr.shape, "| range:",
+      float(Xtr.min()), "to", float(Xtr.max()))
+
+#%% md
+### A minimal training loop
+
+Deliberately plain — no schedules, no tricks, nothing clever. We are comparing
+architectures, so everything else is held fixed. Notebook 2 is where the loop
+itself gets interesting.
+
+#%% code
+@torch.no_grad()
+def accuracy(model, X, Y, bs=512):
+    model.eval()
+    correct = 0
+    for i in range(0, len(X), bs):
+        pred = model(X[i:i + bs].to(DEVICE)).argmax(1).cpu()
+        correct += (pred == Y[i:i + bs]).sum().item()
+    return correct / len(X)
+
+
+def train(model, epochs=8, lr=1e-3, bs=128, log=True):
+    model = model.to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()
+    history = []
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = torch.randperm(len(Xtr))
+        running = 0.0
+        for i in range(0, len(Xtr), bs):
+            b = perm[i:i + bs]
+            x, y = Xtr[b].to(DEVICE), Ytr[b].to(DEVICE)
+            opt.zero_grad()
+            loss = loss_fn(model(x), y)
+            loss.backward()
+            opt.step()
+            running += loss.item() * len(b)
+        va = accuracy(model, Xva, Yva)
+        history.append((running / len(Xtr), va))
+        if log:
+            print(f"  epoch {ep + 1}/{epochs}  loss {running / len(Xtr):.4f}"
+                  f"  val acc {va:.3f}")
+    print(f"  done in {time.time() - t0:.0f} s")
+    return model, history
+
+
+print("MLP")
+mlp, mlp_hist = train(make_mlp())
+print("\nCNN")
+cnn, cnn_hist = train(make_cnn())
+
+#%% md
+Both models learn the task on centred events. That is the universal
+approximation theorem doing its job: the MLP *can* represent this function, and
+with enough centred examples it finds a version of it.
+
+Now move the events.
+
+#%% code
+rows = []
+for name, model in [("MLP", mlp), ("CNN", cnn)]:
+    rows.append((name, n_params(model),
+                 accuracy(model, Xva, Yva),
+                 accuracy(model, Xte, Yte)))
+
+print(f"{'model':<6}{'params':>12}{'centred val':>14}{'shifted test':>15}")
+print("-" * 47)
+for name, p, a_in, a_out in rows:
+    print(f"{name:<6}{p:>12,}{a_in:>14.3f}{a_out:>15.3f}")
+print(f"\n(chance level = 0.500)")
+
+#%% md
+There it is.
+
+The MLP, with roughly 150 times more parameters, **collapses to chance** the
+moment the event moves somewhere it has not seen. It never learned what a kink
+looks like. It learned which pixels tend to be lit in a kink event *near the
+centre of the image*, which is a completely different function that happens to
+agree with the right answer on the training distribution.
+
+The CNN barely notices. Not because it is bigger — it is 150× smaller — and not
+because it was trained better. Because *the function it cannot express* is
+"a kink at the centre is different from a kink in the corner." Weight sharing
+makes that hypothesis unavailable. The inductive bias did not help the CNN find
+a better solution inside a large space; it **deleted the wrong answers from the
+space**.
+
+> This is the shape of every argument in this lecture. Architecture is a prior.
+> A good prior removes solutions that fit your training data and are wrong.
+
+### Degradation curve
+
+A single shifted test set gives one number. Sweep the shift and you get the
+whole story — including the part that is *not* flattering to the CNN.
+
+#%% code
+jitters = [0, 6, 12, 18, 24, 30, 36, 42]
+curves = {"MLP": [], "CNN": []}
+for j in jitters:
+    ds = ms.generate_kink_dataset(800, seed=100 + j, jitter=float(j))
+    X, Y = prepare(ds)
+    curves["MLP"].append(accuracy(mlp, X, Y))
+    curves["CNN"].append(accuracy(cnn, X, Y))
+
+fig, ax = plt.subplots(figsize=(6, 4))
+for name, style in [("MLP", "o-"), ("CNN", "s-")]:
+    ax.plot(jitters, curves[name], style, label=name)
+ax.axvspan(0, 6, color="green", alpha=0.10)
+ax.text(0.4, 0.55, "trained here", fontsize=9, color="green")
+ax.axhline(0.5, ls=":", c="grey"); ax.text(30, 0.515, "chance", fontsize=8, color="grey")
+ax.set_xlabel("vertex displacement from image centre  [pixels]")
+ax.set_ylabel("accuracy")
+ax.set_ylim(0.4, 1.05); ax.legend(); ax.grid(alpha=0.3)
+plt.show()
+
+#%% md
+Two things to read off this plot.
+
+**The MLP falls off a cliff at the edge of its training distribution.** This is
+not a subtle generalisation gap; it is a model doing something categorically
+different from what you thought it was doing. If you had validated only on
+centred events — as people routinely do, because the validation set is a random
+split of the training set — you would have shipped this model believing it was
+94 % accurate.
+
+**The CNN is flat all the way across.** It generalises perfectly to a region of
+the detector it never saw during training, with 150× fewer parameters, because
+weight sharing means "somewhere it has not seen" is not a meaningful concept for
+it.
+
+### But the invariance is not exact
+
+It would be easy to stop here and tell you a CNN is translation invariant. It is
+not, and the difference matters enough that a whole lecture is built on it.
+
+Accuracy is a blunt instrument: our decision margin is large, so small
+perturbations to the network's output never flip a prediction and never show up
+as a change in accuracy. So measure the **output itself**. We shift each test
+image by $s$ pixels — cyclically, so nothing is clipped and nothing leaves the
+image — and record how much the classification margin moves. A truly invariant
+function would give exactly zero for every $s$.
+
+#%% code
+@torch.no_grad()
+def margin(model, X, bs=256):
+    """Signed decision margin, logit(kink) - logit(straight).
+
+    Accuracy only tells us which logit is larger. The margin is the continuous
+    quantity underneath it, so it can reveal a change too small to flip any
+    prediction -- which is exactly what we are looking for here.
+    """
+    model.eval()
+    out = []
+    for i in range(0, len(X), bs):
+        logits = model(X[i:i + bs].to(DEVICE))        # (bs, 2)
+        out.append((logits[:, 1] - logits[:, 0]).cpu())
+    return torch.cat(out)                             # (N,)
+
+
+Xsm, Ysm = prepare(ms.generate_kink_dataset(600, seed=7, jitter=6))
+base = margin(cnn, Xsm)
+shifts = list(range(0, 13))
+delta = []
+for s in shifts:
+    m = margin(cnn, torch.roll(Xsm, shifts=(s, s), dims=(2, 3)))
+    delta.append((m - base).abs().mean().item())
+
+print(f"typical |margin| = {base.abs().mean():.2f}\n")
+print(" shift   mean |change in margin|")
+for s, d in zip(shifts, delta):
+    print(f"  {s:>3}    {d:8.4f}   {'odd ' if s % 2 else 'even'}")
+
+fig, ax = plt.subplots(figsize=(6, 3.4))
+ax.bar([s for s in shifts if s % 2 == 0], [d for s, d in zip(shifts, delta) if s % 2 == 0],
+       color="#4cc9f0", label="even shift")
+ax.bar([s for s in shifts if s % 2 == 1], [d for s, d in zip(shifts, delta) if s % 2 == 1],
+       color="#f7b32b", label="odd shift")
+ax.set_xlabel("cyclic shift [pixels]")
+ax.set_ylabel("mean |Δ margin|")
+ax.set_title("a 'translation invariant' network is not, quite", fontsize=10)
+ax.legend(); ax.grid(alpha=0.3, axis="y")
+plt.show()
+
+#%% md
+The output changes — and it changes with a clear **odd/even structure**: a shift
+by an odd number of pixels perturbs the margin roughly five times more than a
+shift by an even number.
+
+That pattern is a fingerprint. Our network contains two `MaxPool2d(2)` layers, so
+the feature map is subsampled on a stride-2 grid. Shifting the input by an even
+number of pixels moves features to a position the grid can still represent;
+shifting by an odd number does not, and a different pixel wins the pooling
+window. The network is exactly equivariant to the shifts that survive
+subsampling and only approximately equivariant to the rest. This is **aliasing**,
+in precisely the signal-processing sense you already know.
+
+Two further leaks, which this cyclic-shift test deliberately excludes:
+
+- **Borders.** Real images end. An event straddling the edge is simply cut off.
+- **Zero padding.** `padding=1` means the convolution sees a fictitious ring of
+  zeros, so a kernel near the boundary computes something different from the same
+  kernel in the interior. The network can and does exploit this to infer absolute
+  position — which is exactly the inductive bias we were trying to remove.
+
+So the honest statement is: **a CNN is approximately translation equivariant in
+the interior of the image, up to aliasing from subsampling.** For most work that
+approximation is good enough, and this plot shows why — the violation is ~7 % of
+the margin scale and never flips a prediction.
+
+But "good enough" is not always good enough. When the symmetry is exact physics —
+rotations of a detector, permutations of identical particles, the Euclidean group
+acting on a 3D point cloud — you can build the symmetry into the *mathematics of
+the layer* instead of hoping your training data covers every orientation.
+**That is Lecture 4.** The bars above are the reason it exists.
+
+## 6. An aside worth two minutes: max or mean?
+
+We ended the CNN with global **max**-pooling. The other obvious choice is global
+**average**-pooling, which is what most textbook image classifiers use. Try it.
+
+#%% code
+print("CNN with global AVERAGE pooling")
+cnn_avg, _ = train(make_cnn(pool=nn.AdaptiveAvgPool2d), log=False)
+print(f"  centred val  {accuracy(cnn_avg, Xva, Yva):.3f}")
+print(f"  shifted test {accuracy(cnn_avg, Xte, Yte):.3f}")
+print(f"\n(max-pooled CNN, for comparison: {accuracy(cnn, Xva, Yva):.3f} / "
+      f"{accuracy(cnn, Xte, Yte):.3f})")
+
+#%% md
+The average-pooled network does not learn the task at all.
+
+The reason is our occupancy number from Section 2. The interesting feature — a
+kink — occupies a handful of positions out of the $24 \times 24 = 576$ in the
+final feature map. Averaging over all of them dilutes that signal by two orders
+of magnitude and buries it in whatever the network outputs on empty space. Max
+pooling asks "did this detector fire *anywhere*?", which is precisely the
+question a sparse-signal problem poses.
+
+ImageNet pictures are dense: every pixel belongs to something, and averaging is
+sensible. Detector images are not. **Design choices imported from computer
+vision carry assumptions about natural images, and those assumptions are
+frequently false for physics data.** Check them.
+
+## 7. The same event in three representations
+
+We have been treating the event as a dense $96 \times 96$ array because that is
+convenient for a convolution. But it is a strange choice for data that is 97.5 %
+empty. There are at least three ways to hold the same information:
+
+| representation | stored as | natural architecture |
+|---|---|---|
+| **dense image** | `(H, W)` array of charges, mostly zeros | CNN |
+| **sparse tensor** | list of `(x, y)` coordinates + charges | sparse / submanifold convolution |
+| **point cloud / graph** | set of points with features, optionally with edges | PointNet, GNN, transformer |
+
+They contain identical information. They cost wildly different amounts, and they
+admit completely different inductive biases. Let us count.
+
+#%% code
+i = 12
+coords, feats, plabels = ms.to_points(events["image"][i], events["seg"][i])
+
+print(f"event {i}")
+print(f"  dense array          {events['image'][i].shape}  "
+      f"= {events['image'][i].size:>7,} numbers")
+print(f"  non-zero pixels      {len(coords):>7,}  "
+      f"({100 * len(coords) / events['image'][i].size:.2f} %)")
+print(f"  point cloud          coords {coords.shape} + features {feats.shape}"
+      f"  = {coords.size + feats.size:>7,} numbers")
+print(f"  compression          {events['image'][i].size / (coords.size + feats.size):.1f} x")
+
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.4))
+ms.plot_event(events, i, axes[0], "charge", title="1. dense image")
+axes[1].scatter(coords[:, 0], coords[:, 1], c=feats[:, 0], s=6, cmap="viridis")
+axes[1].set_title("2. point cloud (coords + charge)", fontsize=9)
+axes[1].set_xlim(0, ms.SIZE); axes[1].set_ylim(0, ms.SIZE)
+axes[1].set_aspect("equal"); axes[1].set_facecolor("#101418")
+axes[2].scatter(coords[:, 0], coords[:, 1], c=plabels, s=6,
+                cmap=plt.matplotlib.colors.ListedColormap(ms.SEG_COLORS[1:]))
+axes[2].set_title("3. same points, truth labels", fontsize=9)
+axes[2].set_xlim(0, ms.SIZE); axes[2].set_ylim(0, ms.SIZE)
+axes[2].set_aspect("equal"); axes[2].set_facecolor("#101418")
+for a in axes[1:]:
+    a.set_xticks([]); a.set_yticks([])
+fig.tight_layout(); plt.show()
+
+#%% md
+### What that costs in arithmetic
+
+Parameter count is not the currency your training run is billed in — **FLOPs and
+memory** are. For a dense convolution the cost is the same whether the pixel
+contains a Bragg peak or nothing at all.
+
+#%% code
+def conv_flops(cin, cout, h, w, k=3):
+    """Multiply-accumulates for one dense conv layer over an h x w map."""
+    return cin * cout * k * k * h * w
+
+
+occ = float((events["image"] > 0).mean())
+layers = [(1, 16, 96, 96), (16, 16, 96, 96), (16, 32, 48, 48), (32, 32, 48, 48)]
+total = sum(conv_flops(*l) for l in layers)
+
+print(f"first four conv layers, one event")
+print(f"  dense                       {total / 1e6:8.1f} MFLOP")
+print(f"  fraction spent on empty pixels ~ {100 * (1 - occ):.1f} %")
+print(f"  useful work                 {total * occ / 1e6:8.1f} MFLOP")
+print()
+print(f"one batch of 64 events, activations after layer 1 (float32):")
+print(f"  dense   {64 * 16 * 96 * 96 * 4 / 1e6:8.1f} MB")
+print(f"  sparse  {64 * 16 * 96 * 96 * occ * 4 / 1e6:8.1f} MB")
+
+#%% md
+Roughly **97 % of the arithmetic and 97 % of the activation memory is spent on
+empty space.** On a Colab GPU, memory is the binding constraint on how large a
+model and how big a batch you can use — so this is not an aesthetic complaint,
+it is the difference between a model that fits and one that does not.
+
+Two responses exist, and we will build both in Notebook 3:
+
+- **keep the grid, skip the zeros** — sparse and submanifold convolutions;
+- **abandon the grid** — treat the event as a set of points, which forces you to
+  confront a different symmetry: the points come in no particular order, so your
+  model had better be **permutation invariant**.
+
+## 8. Takeaways
+
+1. **Universal approximation is a statement about existence, not about
+   optimisation.** The MLP could represent the right function. It found a
+   different one that fit the training data.
+2. **An architecture is a prior on the structure of your data.** Its value lies
+   in the wrong answers it makes unrepresentable — here, weight sharing deleted
+   "a kink at the centre differs from a kink in the corner."
+3. **A random validation split hides distribution shift.** The MLP looked 94 %
+   accurate right up until the event moved. Build a test set that varies the
+   thing you claim to be invariant to.
+4. **Check the dumb shortcut before you trust a result.** Total charge nearly
+   solved our first attempt at this task.
+5. **Choices imported from computer vision carry assumptions.** Average pooling
+   is fine for dense natural images and fails outright at 2.5 % occupancy.
+6. **The representation is a modelling decision.** Dense, sparse, and point-cloud
+   views of an identical event differ by more than an order of magnitude in
+   storage and arithmetic, and admit entirely different architectures.
+7. **CNN translation invariance is approximate.** It is exact only up to the
+   aliasing introduced by subsampling, and it leaks further at borders and
+   through zero padding. Lecture 4 is about making it exact.
+
+## 9. Exercises
+
+Try these while the lecture moves on; none takes more than a few minutes.
+
+1. **Permute the pixels.** Apply one fixed random permutation to every image
+   (train and test alike) and retrain both models. The MLP's accuracy should be
+   unchanged — it never used the geometry. The CNN's should be destroyed. This
+   is the cleanest possible statement of what "using the geometry" means.
+2. **How much data does the MLP need** to survive a shift of 30 pixels? Retrain
+   it with `jitter=30` in the *training* set and increase the training set size.
+   Does it get there? At what cost?
+3. **Data augmentation as a poor person's inductive bias.** Keep the MLP, keep
+   `jitter=6` for training, but randomly translate each image during training.
+   How close to the CNN can you get? What did you have to pay? (This is the
+   architecture-versus-augmentation trade-off we return to in Notebook 1.)
+4. **Break the CNN.** Replace the global max-pool with `nn.Flatten()` over the
+   final feature map. You have just reintroduced position dependence. Predict
+   what the shifted-test column will do, then check.

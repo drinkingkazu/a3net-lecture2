@@ -1,0 +1,164 @@
+#%% md
+# Putting lecture slides inside a notebook
+
+**ML Summer School · Large models · Lecture 2 — lecturer utility**
+
+---
+
+You have a slide deck for the lecture and you would like a few slides to appear
+**in the middle of a notebook**, advanced by clicking, rather than switching
+between a PDF viewer and Jupyter.
+
+That is possible. There are three ways to do it, and they are not
+interchangeable — the right one depends on where the notebook will be run and
+whether it needs to survive being *read* rather than *executed*.
+
+| approach | click to advance | works in Colab | needs a live kernel | survives export to HTML/PDF |
+|---|---|---|---|---|
+| **1. images + widget** (`SlideDeck.show`) | ✅ | ✅ | ✅ yes | ❌ (use `show_static`) |
+| **2. iframe to hosted slides** (`embed_url`) | ✅ (native) | ✅ | ❌ | ✅ if online |
+| **3. iframe to a local PDF** (`embed_pdf`) | ✅ (native) | ❌ | ❌ | ⚠️ path-dependent |
+| **4. RISE / jupyterlab-rise** | ✅ | ❌ | ✅ | n/a |
+
+**Approach 1 is the recommended default** and is what this notebook demonstrates:
+rasterise the deck to one image per slide, then display them behind a Prev/Next
+control. It is the only option that works everywhere, including Colab, and it
+does not depend on the deck being hosted anywhere.
+
+**A note on approach 4.** RISE turns *the notebook itself* into a reveal.js
+slideshow — every cell becomes a slide. That is a different thing from what you
+asked for: it presents your notebook as a deck, rather than putting a deck inside
+your notebook. It also does not run in Colab. Mentioned only so you can rule it
+out deliberately.
+
+#%% md
+## Setup
+
+The setup cell below is the same one every notebook in this series uses: it
+clones the course repository and installs it, after which `import mlschool as ms`
+works from anywhere.
+
+`ipywidgets` is preinstalled in Colab and in Jupyter, and the core widgets used
+here (`Image`, `Button`, `IntSlider`) work in Colab without any extra setup.
+(You only need `google.colab.output.enable_custom_widget_manager()` for
+*third-party* widget libraries such as ipyleaflet or plotly's widget mode — not
+for these.)
+
+#%% setup
+
+#%% code
+import os
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+slidekit = ms.slides          # the slide helpers live in the installed package
+
+print("helper loaded:", [n for n in dir(slidekit) if not n.startswith("_")])
+
+#%% md
+## Step 1 — turn your deck into one image per slide
+
+Do this **once, offline**, and keep the PNGs next to the notebook. Students then
+need no PDF tooling at all.
+
+```python
+# from a PDF (PowerPoint/Keynote: export to PDF first, or
+#   libreoffice --headless --convert-to pdf deck.pptx)
+slidekit.pdf_to_images("lecture2.pdf", "slides/", dpi=110)
+```
+
+`pdf_to_images` uses **PyMuPDF** if it is installed (`pip install pymupdf`, no
+system packages) and otherwise falls back to poppler's `pdftoppm`. Colab has
+poppler preinstalled, so on Colab either route works.
+
+For this demo we do not have your deck, so we fabricate a four-slide placeholder
+with matplotlib. Replace this cell with the call above and everything downstream
+is unchanged.
+
+#%% code
+os.makedirs("demo_slides", exist_ok=True)
+TITLES = [("Inductive bias", "architecture as a prior on structure"),
+          ("Receptive field", "how far back can one unit see?"),
+          ("Vanishing gradients", "why depth needs residuals"),
+          ("Summary", "structure - optimisation - diagnosis")]
+for i, (title, sub) in enumerate(TITLES):
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    ax.axis("off")
+    ax.add_patch(plt.Rectangle((0, 0.86), 1, 0.14, color="#101418"))
+    ax.text(0.04, 0.90, f"Lecture 2  ·  slide {i + 1}", color="white", size=12)
+    ax.text(0.5, 0.55, title, ha="center", size=34, weight="bold")
+    ax.text(0.5, 0.42, sub, ha="center", size=15, color="#4a5568")
+    fig.savefig(f"demo_slides/slide_{i:03d}.png", dpi=90, bbox_inches="tight")
+    plt.close(fig)
+print("wrote", len(TITLES), "placeholder slides to demo_slides/")
+
+#%% md
+## Step 2 — show them, one at a time, wherever you like in the notebook
+
+This is the cell you drop into the middle of a lecture notebook. Click
+**Next ▶** / **◀ Prev**, or drag the slider.
+
+#%% code
+deck = slidekit.SlideDeck("demo_slides", width=760)
+print(f"{len(deck)} slides loaded")
+deck.show(start=0)
+
+#%% md
+Some practical notes.
+
+**Start where you like.** `deck.show(start=2)` opens on slide 3, so you can put
+several viewer cells through the notebook, each opening at the relevant slide,
+all sharing one deck object.
+
+**Widget output is not saved into the `.ipynb`.** If somebody opens the notebook
+on GitHub without running it, the viewer area will be blank. That is a property
+of all ipywidgets, not of this helper. When the notebook needs to be *readable*
+rather than *runnable*, use the static form below — the images are embedded as
+base64 and survive export to HTML and PDF.
+
+#%% code
+deck.show_static([0, 3], width=520)
+
+#%% md
+## Alternative — embed hosted slides directly
+
+If your deck already lives on the web, skip the conversion entirely. This gives
+you the provider's own slide navigation and works in Colab, because the content
+is fetched over https rather than from the local filesystem.
+
+```python
+# Google Slides: File -> Share -> Publish to the web -> Embed, then paste the src
+slidekit.embed_url("https://docs.google.com/presentation/d/e/XXXX/embed"
+                   "?start=false&loop=false", width=900, height=560)
+
+# any PDF reachable by URL
+slidekit.embed_url("https://example.org/lecture2.pdf", height=620)
+```
+
+And for a **local** PDF, when you are running Jupyter on your own machine (this
+will *not* work in Colab, whose cell outputs are sandboxed and cannot read local
+files):
+
+```python
+slidekit.embed_pdf("lecture2.pdf", page=12, height=620)
+```
+
+We do not execute those here because they need your URLs, but both are one-liners
+returning an `IPython.display.IFrame`.
+
+## Recommendation
+
+For this lecture set, where the notebooks must run on Colab and are also read as
+lecture notes:
+
+1. Export the deck to PDF, run `pdf_to_images` once, and commit the PNGs.
+2. Use `deck.show(start=n)` at the points in the notebook where you want to talk
+   over slides during the lecture.
+3. Use `deck.show_static([...])` for the two or three slides that are genuinely
+   part of the written narrative, so they survive for students reading the
+   notebook afterwards without executing it.
+
+The images add to the repository size — a 40-slide deck at 110 dpi is a few MB —
+so keep the dpi modest and consider committing only the slides you actually
+embed.

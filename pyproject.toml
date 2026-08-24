@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlschool"
+version = "1.0.0"
+description = "Helpers for ML Summer School lecture 2: large models (CNNs, GNNs, applications)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+# torch is deliberately NOT a hard dependency: Colab and the project container
+# already ship a build matched to their CUDA version, and letting pip "helpfully"
+# reinstall it is a reliable way to break a lecture.
+dev = ["torch", "tqdm"]
+
+[tool.setuptools]
+packages = ["mlschool"]

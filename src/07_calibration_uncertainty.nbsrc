@@ -1,0 +1,820 @@
+#%% md
+# Lecture 2 · Notebook 7 — Calibration and uncertainty: turning scores into numbers you can use
+
+**ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
+
+*Extra notebook. Stand-alone — it does not depend on the others, and it runs on
+a free Colab GPU (or on CPU, slowly).*
+
+---
+
+### Why this notebook exists
+
+Every model in this lecture ends with a `softmax` and we have been reading the
+result as a probability. In a physics analysis that is not a harmless abuse of
+language. You will want to:
+
+- **cut** at a fixed signal efficiency, and know what efficiency you actually got;
+- **weight** events by their classification probability;
+- put a network output into a **likelihood** or a template fit;
+- quote an **uncertainty** on a regressed energy, and have your pull distribution
+  come out unit-width.
+
+All four require the number to *mean* something. A softmax output is a
+normalised exponential of some logits; nothing in the training procedure forces
+it to equal the frequency with which the model is right. And in practice, modern
+networks are **systematically overconfident**.
+
+This notebook is about measuring that and fixing it. It covers:
+
+1. **Reliability diagrams and ECE** — how to measure whether "0.9" means 0.9.
+2. **Temperature scaling** — a one-parameter fix that costs nothing and works
+   remarkably well.
+3. Why calibration **does not survive a domain shift**, which matters enormously
+   if you calibrate on simulation and deploy on data.
+4. **MC dropout** and **deep ensembles** — and an honest measurement of when
+   ensembles help and when they do not.
+5. **Regression uncertainty**: predicting $\sigma$ as well as $\mu$, and checking
+   it the way a physicist would — with a **pull distribution** and a coverage
+   test.
+
+A distinction worth having in mind throughout:
+
+| | what it is | can you reduce it? |
+|---|---|---|
+| **aleatoric** | genuine ambiguity in the data — two classes really do look alike at low energy | no, not with more data |
+| **epistemic** | the model's ignorance — not enough training data, or an input unlike anything it has seen | yes, with more data |
+
+Calibration is mostly about getting the *aleatoric* part right. Ensembles are
+mostly about detecting the *epistemic* part. You need both, and they fail
+differently.
+
+**Runtime:** roughly 8–12 minutes on a Colab T4.
+
+#%% md
+## 0. Setup
+
+#%% setup
+
+#%% code
+import copy
+import time
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+torch.manual_seed(0)
+np.random.seed(0)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("torch", torch.__version__, "| device:", DEVICE)
+
+#%% md
+## 1. A task that is actually hard
+
+Calibration is only interesting when the model is sometimes wrong. Everywhere
+else in this lecture our classifier reaches 99 %+ accuracy, and a model that is
+right 99.5 % of the time has nothing interesting to be uncertain about.
+
+So we make the problem genuinely hard, in a physically meaningful way: we
+**coarse-grain the readout**. Instead of the full $96\times96$ image we average
+down to $24\times24$, as if the detector had 4× coarser pixels. That destroys
+exactly the fine structure that distinguishes a thin line from a small diffuse
+blob, so track-like and shower-like events genuinely overlap. The ambiguity is
+**aleatoric**: no amount of extra training data removes it.
+
+We also train on a **small sample** and train it hard, which adds the second,
+epistemic ingredient — and is a fair model of what you do when labels are
+expensive.
+
+#%% code
+train_pool = ms.generate_dataset(4000, seed=0, progress=True)
+calib      = ms.generate_dataset(1000, seed=5)      # held out, for calibration only
+val        = ms.generate_dataset(1500, seed=1)
+
+CHARGE_SCALE = float(np.percentile(train_pool["image"][train_pool["image"] > 0], 99))
+COARSEN = 4
+
+
+def prepare(ds):
+    x = torch.tensor(ds["image"])[:, None] / CHARGE_SCALE
+    return F.avg_pool2d(x, COARSEN), torch.tensor(ds["label"])
+
+
+Xpool, Ypool = prepare(train_pool)
+Xc, Yc = prepare(calib)
+Xv, Yv = prepare(val)
+DIM = Xpool.shape[-1]
+N_TRAIN = 400
+X, Y = Xpool[:N_TRAIN], Ypool[:N_TRAIN]
+print(f"coarse-grained readout: {ms.SIZE}x{ms.SIZE} -> {DIM}x{DIM}")
+print(f"train {tuple(X.shape)}   calibration {tuple(Xc.shape)}   val {tuple(Xv.shape)}")
+
+fig, axes = plt.subplots(2, 5, figsize=(10, 4.2))
+for k in range(5):
+    ms.plot_event(train_pool, k, axes[0, k], "charge")
+    axes[1, k].imshow(Xpool[k, 0], cmap="viridis", origin="lower")
+    axes[1, k].set_xticks([]); axes[1, k].set_yticks([])
+axes[0, 0].set_ylabel("full readout", fontsize=9)
+axes[1, 0].set_ylabel(f"coarse {DIM}x{DIM}", fontsize=9)
+fig.tight_layout(); plt.show()
+
+#%% code
+def make_model(p_drop=0.0):
+    return nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(DIM * DIM, 128), nn.ReLU(), nn.Dropout(p_drop),
+        nn.Linear(128, 64), nn.ReLU(), nn.Dropout(p_drop),
+        nn.Linear(64, 3))
+
+
+def fit(model, X, Y, epochs=80, lr=2e-3, bs=64, seed=0):
+    torch.manual_seed(seed)
+    model = model.to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(len(X))
+        for i in range(0, len(perm), bs):
+            b = perm[i:i + bs]
+            if len(b) < 2:
+                continue
+            opt.zero_grad()
+            F.cross_entropy(model(X[b].to(DEVICE)), Y[b].to(DEVICE)).backward()
+            opt.step()
+    return model
+
+
+@torch.no_grad()
+def get_logits(model, X, bs=256, train_mode=False):
+    model.train() if train_mode else model.eval()
+    return torch.cat([model(X[i:i + bs].to(DEVICE)).cpu() for i in range(0, len(X), bs)])
+
+
+t0 = time.time()
+base_model = fit(make_model(), X, Y)
+print(f"trained in {time.time() - t0:.0f} s")
+
+#%% md
+## 2. Measuring calibration
+
+**The definition.** A classifier is calibrated if, among all the events where it
+says "70 % confident", it is right 70 % of the time. That is a statement about
+frequencies, and you check it by binning.
+
+**The reliability diagram.** Bin events by predicted confidence; in each bin plot
+the actual accuracy against the mean confidence. Perfect calibration is the
+diagonal. Below the diagonal means overconfident.
+
+**Expected Calibration Error (ECE)** is the weighted mean absolute gap between
+those two, i.e. the average vertical distance from the diagonal:
+
+$$\text{ECE} = \sum_b \frac{n_b}{N}\,\bigl|\,\text{acc}(b) - \text{conf}(b)\,\bigr|$$
+
+ECE is a summary and it hides things — a model can have small ECE while being
+badly wrong in the high-confidence bins you actually cut on. **Always look at the
+diagram, not just the number.**
+
+#%% code
+def calibration_bins(probs, labels, n_bins=15):
+    # probs: (N, n_classes). .max(1) returns BOTH the value and its index, i.e.
+    # the confidence and the predicted class in one call.
+    conf, pred = probs.max(1)                  # (N,) confidence, (N,) prediction
+    correct = (pred == labels).float()         # (N,) 1.0 where the model was right
+    edges = torch.linspace(0, 1, n_bins + 1)
+    out = []
+    for i in range(n_bins):
+        m = (conf > edges[i]) & (conf <= edges[i + 1])
+        if m.sum() > 0:
+            out.append((float(edges[i] + edges[i + 1]) / 2, float(conf[m].mean()),
+                        float(correct[m].mean()), int(m.sum())))
+    return out
+
+
+def ece(probs, labels, n_bins=15):
+    bins = calibration_bins(probs, labels, n_bins)
+    n = len(labels)
+    return sum(cnt / n * abs(acc - cf) for _, cf, acc, cnt in bins)
+
+
+def report(tag, probs, labels):
+    conf, pred = probs.max(1)
+    acc = (pred == labels).float().mean()
+    nll = F.nll_loss(probs.clamp_min(1e-12).log(), labels)
+    print(f"{tag:<32} acc {acc:.3f}   mean conf {conf.mean():.3f}   "
+          f"gap {conf.mean() - acc:+.3f}   ECE {ece(probs, labels):.4f}   "
+          f"NLL {nll:.3f}")
+    return float(ece(probs, labels))
+
+
+def reliability_plot(ax, probs, labels, title, n_bins=15):
+    bins = calibration_bins(probs, labels, n_bins)
+    cf = [b[1] for b in bins]; acc = [b[2] for b in bins]; cnt = [b[3] for b in bins]
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="perfect")
+    ax.bar(cf, acc, width=1 / n_bins * 0.9, color="#4cc9f0",
+           edgecolor="k", lw=0.4, label="accuracy")
+    ax.plot(cf, cf, color="#f7b32b", lw=1.5, label="confidence")
+    for c, a, n in zip(cf, acc, cnt):
+        if n > 5:
+            ax.text(c, max(a, c) + 0.02, str(n), fontsize=6, ha="center", rotation=90)
+    ax.set_xlim(0, 1.05); ax.set_ylim(0, 1.12)
+    ax.set_xlabel("confidence"); ax.set_ylabel("accuracy")
+    ax.set_title(title, fontsize=9); ax.legend(fontsize=7, loc="upper left")
+
+
+logits_v = get_logits(base_model, Xv)
+probs_v = logits_v.softmax(1)
+report("single model, uncalibrated", probs_v, Yv)
+
+fig, ax = plt.subplots(figsize=(4.6, 4.2))
+reliability_plot(ax, probs_v, Yv, "reliability diagram (bin counts annotated)")
+plt.show()
+
+#%% md
+Look at the rightmost bins, because that is where your analysis lives. The model
+places most events in the top confidence bin and claims ~0.95 there, while
+actually being right substantially less often. The blue bars sit below the orange
+line: **overconfident**.
+
+Two mechanisms produced this, and they are worth separating:
+
+- **Aleatoric.** After coarse-graining, some events genuinely are ambiguous. The
+  best possible model would output something like 0.6 on those. Ours does not: it
+  was trained with cross-entropy against *hard* labels, which pushes every output
+  towards 0 or 1 regardless of whether the evidence supports it.
+- **Epistemic / overfitting.** With 400 training events trained for 80 epochs, the
+  model drives its training NLL towards zero. Achieving near-zero NLL *requires*
+  extreme confidence. The confidence is fitted to the training set, and it does
+  not transfer.
+
+This is the modern-network default. Bigger models, trained longer, with less
+regularisation, are more overconfident — the phenomenon got *worse* as
+architectures improved.
+
+## 3. Temperature scaling
+
+The fix is almost insultingly simple. Divide the logits by a single scalar $T$
+before the softmax:
+
+$$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
+
+- $T > 1$ softens the distribution (less confident);
+- $T < 1$ sharpens it;
+- $T = 1$ changes nothing.
+
+Fit $T$ by minimising the negative log-likelihood **on a held-out calibration
+set** — never on the training set, which is where the overconfidence came from,
+and never on the test set you are going to quote.
+
+The crucial property: **dividing all logits by a positive constant cannot change
+which one is largest.** Temperature scaling therefore leaves accuracy *exactly*
+unchanged. It is free in the only currency that usually matters, which is why it
+should be your default.
+
+#%% code
+def fit_temperature(logits, labels):
+    """One parameter, fitted by L-BFGS on held-out data."""
+    # Optimise log T rather than T, so that T = exp(log_T) is positive by
+    # construction and we never have to constrain the optimiser.
+    log_T = torch.zeros(1, requires_grad=True)          # log T = 0  <=>  T = 1
+    opt = torch.optim.LBFGS([log_T], lr=0.1, max_iter=100)
+
+    # LBFGS is a second-order method: it may evaluate the loss several times per
+    # step, so it demands a `closure` that recomputes loss and gradient on demand
+    # rather than the single backward() pass a first-order optimiser needs.
+    def closure():
+        opt.zero_grad()
+        loss = F.cross_entropy(logits / log_T.exp(), labels)
+        loss.backward()
+        return loss
+
+    with warnings.catch_warnings():                     # LBFGS is chatty internally
+        warnings.simplefilter("ignore")
+        opt.step(closure)
+    return float(log_T.detach().exp())
+
+
+logits_c = get_logits(base_model, Xc)
+T = fit_temperature(logits_c, Yc)
+print(f"fitted temperature T = {T:.3f}   (T > 1 means the model was overconfident)\n")
+
+probs_T = (logits_v / T).softmax(1)
+report("single model, uncalibrated", probs_v, Yv)
+report("  + temperature scaling", probs_T, Yv)
+
+fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.2))
+reliability_plot(axes[0], probs_v, Yv, f"before (T = 1)")
+reliability_plot(axes[1], probs_T, Yv, f"after (T = {T:.2f})")
+fig.tight_layout(); plt.show()
+
+#%% md
+ECE drops by roughly a factor of three, NLL improves substantially, and
+**accuracy is identical to the last digit** — as promised.
+
+Some practical notes:
+
+- **One parameter cannot fix everything.** Temperature scaling applies the same
+  correction to every event. If your model is overconfident on showers and
+  underconfident on tracks, a single $T$ will not capture that. Per-class
+  temperatures, vector scaling, or isotonic regression can; they need more
+  calibration data and can overfit it.
+- **Use a proper held-out set.** A few hundred to a few thousand events is
+  plenty for one parameter. Reusing the training set fits the overconfidence
+  rather than removing it.
+- **Recalibrate whenever anything changes** — a retrained model, a new detector
+  run, a different selection. $T$ is a property of the model *and* the
+  distribution, which brings us to the next section.
+
+## 4. Calibration does not survive a domain shift
+
+This is the part that matters most for physics, and it follows directly from
+Notebook 4: if you fit $T$ on simulation and run on data, you have calibrated the
+wrong distribution.
+
+#%% code
+DATA_DOMAIN = dict(gain=0.25, noise_rate=900, scatter=0.18)
+shifted = ms.generate_dataset(1500, seed=11, **DATA_DOMAIN)
+Xs, Ys = prepare(shifted)
+
+logits_s = get_logits(base_model, Xs)
+print("evaluated on SHIFTED data:")
+report("  uncalibrated", logits_s.softmax(1), Ys)
+report("  + T fitted on simulation", (logits_s / T).softmax(1), Ys)
+
+# what if we could fit T on labelled target data?
+shift_calib = ms.generate_dataset(600, seed=12, **DATA_DOMAIN)
+Xsc, Ysc = prepare(shift_calib)
+T_shift = fit_temperature(get_logits(base_model, Xsc), Ysc)
+report(f"  + T fitted on shifted (T={T_shift:.2f})", (logits_s / T_shift).softmax(1), Ys)
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.1))
+reliability_plot(axes[0], logits_s.softmax(1), Ys, "shifted data, uncalibrated")
+reliability_plot(axes[1], (logits_s / T).softmax(1), Ys, f"T from simulation ({T:.2f})")
+reliability_plot(axes[2], (logits_s / T_shift).softmax(1), Ys,
+                 f"T from shifted data ({T_shift:.2f})")
+fig.tight_layout(); plt.show()
+
+#%% md
+Three things to take away.
+
+**The domain shift wrecks calibration far more than it wrecks accuracy.** Accuracy
+falls, but the confidence barely notices — the model is just as sure of itself
+while being much more often wrong. ECE on shifted data is an order of magnitude
+worse than in-domain.
+
+**A temperature fitted on simulation barely helps.** It was fitted to correct a
+different miscalibration. This is the single most important practical warning in
+this notebook: *calibrating on simulation does not calibrate you on data.*
+
+**A temperature fitted on labelled target data helps more — but does not rescue
+the model.** It finds a much larger $T$, and the NLL improves a lot, yet the ECE
+stays poor. The reason is worth sitting with: once accuracy has collapsed towards
+chance, the *only* honest output is ~1/3 for every class, and no single scalar
+applied to badly-wrong logits can produce that on the right events. Calibration
+can make a mediocre model honest; it cannot make a broken model useful.
+
+Still, this is what the labelled control samples in your analysis are for. If you
+have a control region where you know the truth, that is where calibration
+constants come from — and if calibrating there cannot fix your numbers, that is a
+signal to go back and fix the *model* (Notebook 4), not the temperature.
+
+> **The honest summary:** post-hoc calibration is a fix for a *statistical* mismatch
+> between your confidence and your accuracy on a distribution you can sample with
+> labels. It is not a fix for not knowing what your data looks like.
+
+## 5. Uncertainty from disagreement: MC dropout and ensembles
+
+Temperature scaling makes the *average* confidence honest. It does not tell you
+which *individual* events the model is unsure about, and it can never say "this
+input is unlike anything I was trained on" — for that you need something that
+represents the model's own ignorance.
+
+The standard trick is to build a **distribution over models** and look at how
+much its members disagree.
+
+- **MC dropout.** Leave dropout switched on at inference and run $K$ forward
+  passes. Each pass is a slightly different sub-network; their spread is a crude
+  posterior. Nearly free, and often disappointing.
+- **Deep ensembles.** Train $K$ independent models and average their predicted
+  probabilities. Consistently the strongest simple method — and, as we are about
+  to measure, only when the members are actually different from each other.
+
+#%% code
+# MC dropout
+drop_model = fit(make_model(p_drop=0.3), X, Y)
+# train_mode=True leaves dropout ACTIVE at inference, so each pass samples a
+# different sub-network. Stacking gives (30, N, n_classes); averaging over axis 0
+# is the Monte-Carlo estimate of the predictive distribution.
+mc = torch.stack([get_logits(drop_model, Xv, train_mode=True).softmax(1)
+                  for _ in range(30)])
+report("dropout net, deterministic", get_logits(drop_model, Xv).softmax(1), Yv)
+report("dropout net, 30 MC passes", mc.mean(0), Yv)
+
+#%% code
+# Ensembles: two flavours of "independent"
+K = 5
+same_data, diff_data, diff_shifted = [], [], []
+t0 = time.time()
+for s in range(K):
+    # flavour 1: identical training data, different initialisation only
+    m = fit(make_model(), X, Y, seed=s)
+    same_data.append(get_logits(m, Xv).softmax(1))
+
+    # flavour 2: a different random 400-event subset for each member
+    idx = torch.randperm(len(Xpool),
+                         generator=torch.Generator().manual_seed(100 + s))[:N_TRAIN]
+    m = fit(make_model(), Xpool[idx], Ypool[idx], seed=s)
+    diff_data.append(get_logits(m, Xv).softmax(1))
+    diff_shifted.append(get_logits(m, Xs).softmax(1))   # keep for §5b below
+print(f"trained {2 * K} models in {time.time() - t0:.0f} s\n")
+
+report("single model", probs_v, Yv)
+report(f"ensemble of {K}: same data, diff init", torch.stack(same_data).mean(0), Yv)
+report(f"ensemble of {K}: different data each", torch.stack(diff_data).mean(0), Yv)
+
+#%% md
+### Read that carefully, because it contradicts the usual advice
+
+The standard recipe for a deep ensemble is "train $K$ models with different random
+seeds and average them". We did exactly that — and it changed **essentially
+nothing**. The ensemble of five models trained on the same 400 events is no better
+calibrated than any single member.
+
+Give each member a *different* 400 events and the same five models improve
+accuracy by several points and cut ECE by roughly a factor of four.
+
+The reason is that **an ensemble's value comes entirely from the diversity of its
+members**. Five models trained on identical data with identical hyperparameters,
+differing only in initialisation, converge to essentially the same function and
+make the same mistakes with the same confidence. Averaging correlated predictions
+does nothing. The literature's positive results are usually on large datasets
+where stochastic training explores genuinely different solutions; in the
+small-data regime that physicists frequently occupy, you must inject the diversity
+yourself — different subsets, different architectures, different augmentations,
+different hyperparameters.
+
+**MC dropout** lands in between: better than the same dropout network evaluated
+deterministically, well short of a diverse ensemble. It is cheap, and worth having
+when you cannot afford $K$ training runs, but do not mistake it for a posterior.
+
+### Does the uncertainty know when it is out of its depth?
+
+The real test of an epistemic uncertainty is whether it *rises* on inputs the
+model has never seen. Our shifted domain is exactly such an input.
+
+#%% code
+def entropy(p):
+    return -(p.clamp_min(1e-12) * p.clamp_min(1e-12).log()).sum(1)
+
+
+ens_v = torch.stack(diff_data).mean(0)          # diverse ensemble, in-domain
+ens_s = torch.stack(diff_shifted).mean(0)       # same members, shifted data
+
+fig, ax = plt.subplots(figsize=(6.4, 3.8))
+bins = np.linspace(0, np.log(3), 40)
+ax.hist(entropy(probs_v).numpy(), bins=bins, alpha=0.55, density=True,
+        label="single model, in-domain")
+ax.hist(entropy(logits_s.softmax(1)).numpy(), bins=bins, alpha=0.55, density=True,
+        label="single model, SHIFTED")
+ax.hist(entropy(ens_s).numpy(), bins=bins, histtype="step", lw=2, density=True,
+        label="diverse ensemble, SHIFTED")
+ax.axvline(np.log(3), ls=":", c="k")
+ax.text(np.log(3) - 0.02, ax.get_ylim()[1] * 0.9, "max entropy", fontsize=7,
+        rotation=90, ha="right")
+ax.set_xlabel("predictive entropy"); ax.set_ylabel("density")
+ax.legend(fontsize=8); plt.show()
+
+for tag, p in [("single, in-domain", probs_v), ("single, shifted", logits_s.softmax(1)),
+               ("ensemble, shifted", ens_s)]:
+    print(f"{tag:<22} mean entropy {entropy(p).mean():.3f}  "
+          f"(max possible {np.log(3):.3f})")
+
+#%% md
+Read the single-model numbers again, because they are worse than "barely moves":
+handed data from a distribution it has never seen, and getting it wrong about as
+often as guessing, the single model's mean entropy actually goes **down**. It is
+*more* certain on the data it cannot handle than on the data it can. There is no
+mechanism in a single softmax network that would make it otherwise — nothing in
+the training objective ever showed it an unfamiliar input and asked it to hedge.
+
+The diverse ensemble does shift to noticeably higher entropy, because its members
+disagree about unfamiliar inputs even though each is individually confident.
+
+**That shift is the useful signal.** It will not tell you the data is shifted, and
+it is nowhere near a rigorous out-of-distribution test — but a rise in ensemble
+disagreement between your simulation and your real data is a cheap alarm bell,
+and it costs you $K$ training runs you were probably going to do anyway.
+
+## 6. Regression: predicting $\sigma$, and checking it with a pull
+
+For a regressed quantity — energy, position, momentum — a physicist does not want
+a point estimate. They want $\mu \pm \sigma$, and they want the pull
+
+$$\text{pull} = \frac{y_{\text{true}} - \mu}{\sigma}$$
+
+to be a unit Gaussian. That is a far more demanding test than any ECE, and it is
+the natural language for this audience.
+
+The standard method is to have the network output **two** numbers per event, a
+mean and a log-variance, and train with the Gaussian negative log-likelihood:
+
+$$\mathcal{L} = \frac{1}{2}\left[\frac{(y - \mu)^2}{\sigma^2} + \log \sigma^2\right]$$
+
+Note what this loss does. The first term is a squared error *weighted by the
+model's own claimed precision*; the second term punishes claiming precision you
+do not have. Together they let the model say "this event is hard" and be rewarded
+for honesty. Predicting $\log \sigma^2$ rather than $\sigma^2$ keeps it positive
+and the optimisation well-conditioned.
+
+#%% code
+E_MEAN = float(train_pool["energy"].mean())
+E_STD = float(train_pool["energy"].std())
+
+
+def prep_energy(ds):
+    x = F.avg_pool2d(torch.tensor(ds["image"])[:, None] / CHARGE_SCALE, COARSEN)
+    return x, torch.tensor((ds["energy"] - E_MEAN) / E_STD)
+
+
+Xe, Ye = prep_energy(train_pool)
+Xec, Yec = prep_energy(calib)
+Xev, Yev = prep_energy(val)
+
+
+def gaussian_nll(out, y):
+    # The network emits TWO numbers per event: a mean and a log-variance.
+    # Predicting log(sigma^2) instead of sigma^2 keeps it positive automatically
+    # and keeps the optimisation well conditioned. The clamp stops a confident
+    # early model from driving log_var to -inf and producing infinite loss.
+    mu, log_var = out[:, 0], out[:, 1].clamp(-8, 8)
+    # term 1: squared error weighted by the model's OWN claimed precision
+    # term 2: a penalty for claiming precision you do not have
+    return (0.5 * (torch.exp(-log_var) * (y - mu) ** 2 + log_var)).mean()
+
+
+def fit_regressor(epochs=60, lr=2e-3, bs=64, n=1000):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Flatten(), nn.Linear(DIM * DIM, 128), nn.ReLU(),
+                          nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 2)).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(n)
+        for i in range(0, n, bs):
+            b = perm[i:i + bs]
+            opt.zero_grad()
+            gaussian_nll(model(Xe[b].to(DEVICE)), Ye[b].to(DEVICE)).backward()
+            opt.step()
+    return model
+
+
+@torch.no_grad()
+def predict_mu_sigma(model, X, bs=256):
+    model.eval()
+    out = torch.cat([model(X[i:i + bs].to(DEVICE)).cpu() for i in range(0, len(X), bs)])
+    return out[:, 0], torch.exp(0.5 * out[:, 1].clamp(-8, 8))
+
+
+reg = fit_regressor()
+mu_v, sig_v = predict_mu_sigma(reg, Xev)
+pull_raw = (Yev - mu_v) / sig_v
+print(f"RMSE        {float((Yev - mu_v).pow(2).mean().sqrt()) * E_STD:.4f}  (energy units)")
+print(f"mean sigma  {float(sig_v.mean()) * E_STD:.4f}")
+print(f"\npull:  mean {pull_raw.mean():+.3f}   std {pull_raw.std():.3f}"
+      f"     (want 0.000 and 1.000)")
+for k in (1, 2, 3):
+    expected = [0.6827, 0.9545, 0.9973][k - 1]
+    print(f"  coverage |pull| < {k}:  {float((pull_raw.abs() < k).float().mean()):.3f}"
+          f"   (Gaussian expects {expected:.3f})")
+
+#%% md
+**The uncertainties are wrong**, and the pull says so precisely and immediately.
+
+The pull is not centred at zero: $\mu$ is **biased**, systematically low. Its
+width is well above one: $\sigma$ is **underestimated**. Consequently the
+$1\sigma$ interval covers far fewer than 68 % of events. Propagate these into a
+fit and you get a confidently wrong answer with an optimistic error bar — the
+worst possible combination, and one that a plot of RMSE alone would never have
+revealed.
+
+Note how much more informative this is than any calibration metric for
+classification. The pull immediately separates *two different failures* — a bias
+in the central value and a mis-scaled uncertainty — and tells you the size of
+each. This is why it is the right diagnostic for this audience: you already know
+how to read it, and you already know that a pull width of 1.9 means somebody has
+underestimated their errors.
+
+This state of affairs is completely normal for a freshly-trained heteroscedastic
+network, and it is why you must check rather than assume. The good news is that
+the same idea that fixed classification works here.
+
+### Recalibrating a regression uncertainty
+
+Temperature scaling had one parameter. Here we fit **two** on the held-out
+calibration set — a shift $b$ and a scale $s$ — so that the pull becomes
+zero-mean and unit-width:
+
+$$\mu' = \mu + b\,\sigma, \qquad \sigma' = s\,\sigma$$
+
+It is the direct analogue: a cheap post-hoc correction, fitted on held-out data,
+that does not touch the model.
+
+#%% code
+mu_c, sig_c = predict_mu_sigma(reg, Xec)
+pull_c = (Yec - mu_c) / sig_c
+b, s = float(pull_c.mean()), float(pull_c.std())
+print(f"fitted on the calibration set:  bias b = {b:+.3f},  scale s = {s:.3f}\n")
+
+# Apply the two calibration constants fitted on the held-out set. The bias is
+# added in units of sigma, so both corrections are scale-free and transfer to
+# events with different predicted uncertainties.
+mu_cal = mu_v + b * sig_v
+sig_cal = sig_v * s
+pull_cal = (Yev - mu_cal) / sig_cal
+print(f"pull after recalibration:  mean {pull_cal.mean():+.3f}   std {pull_cal.std():.3f}")
+for k in (1, 2, 3):
+    expected = [0.6827, 0.9545, 0.9973][k - 1]
+    print(f"  coverage |pull| < {k}:  {float((pull_cal.abs() < k).float().mean()):.3f}"
+          f"   (Gaussian expects {expected:.3f})")
+
+fig, axes = plt.subplots(1, 2, figsize=(10.5, 3.9))
+grid = np.linspace(-5, 5, 200)
+gauss = np.exp(-grid ** 2 / 2) / np.sqrt(2 * np.pi)
+for ax, pull, title in [(axes[0], pull_raw, "raw"), (axes[1], pull_cal, "recalibrated")]:
+    ax.hist(pull.numpy(), bins=np.linspace(-5, 5, 60), density=True,
+            color="#4cc9f0", edgecolor="k", lw=0.3)
+    ax.plot(grid, gauss, "k--", lw=1.5, label="unit Gaussian")
+    ax.set_title(f"pull distribution, {title}\nmean {pull.mean():+.2f}, "
+                 f"std {pull.std():.2f}", fontsize=9)
+    ax.set_xlabel(r"$(y_{true} - \mu)\,/\,\sigma$"); ax.legend(fontsize=8)
+fig.tight_layout(); plt.show()
+
+#%% md
+Two parameters, fitted on held-out data, and the pull is centred with very nearly
+unit width. The bias is gone and the error bars are the right size *on average*.
+
+**Now look at the shape, not the two moments — because they are not the same
+thing.** Matching the mean and the standard deviation does not make a
+distribution Gaussian, and ours is not: the $1\sigma$ coverage comes out well
+*above* the Gaussian expectation of 0.683 while the $3\sigma$ coverage falls
+*below* 0.997. More events than expected inside one sigma, fewer than expected
+inside three: the pull is peaked in the centre and heavy in the tails.
+
+That combination is exactly what you should worry about. It means the error bars
+are conservative for typical events and optimistic for the rare, badly-measured
+ones — and in a search for a rare process, the tails are the entire game. A
+$3\sigma$ outlier is roughly three times more likely than your Gaussian
+assumption says.
+
+When this happens, stop calibrating the *width* and calibrate the **quantile you
+actually use**: find the scale factor that makes 95 % coverage come out at 95 %,
+and quote that. Or fit a heavier-tailed model — a Student's $t$ — and quote its
+parameters. Exercise 6 asks you to do both.
+
+### Does $\sigma$ know which events are hard?
+
+A calibrated *average* is not enough. A useful uncertainty must be **larger on the
+events that are actually harder**. Otherwise you have a constant error bar with
+extra steps.
+
+#%% code
+order = torch.argsort(sig_cal)
+n_third = len(order) // 3
+print(f"{'group':<26}{'predicted sigma':>18}{'actual RMSE':>14}")
+print("-" * 58)
+for name, sel in [("smallest sigma third", order[:n_third]),
+                  ("middle third", order[n_third:2 * n_third]),
+                  ("largest sigma third", order[2 * n_third:])]:
+    resid = (Yev - mu_cal)[sel]
+    print(f"{name:<26}{float(sig_cal[sel].mean()) * E_STD:>18.4f}"
+          f"{float(resid.pow(2).mean().sqrt()) * E_STD:>14.4f}")
+
+fig, ax = plt.subplots(figsize=(5.4, 4))
+ax.scatter(sig_cal * E_STD, (Yev - mu_cal).abs() * E_STD, s=3, alpha=0.25)
+lim = float((sig_cal * E_STD).max())
+ax.plot([0, lim], [0, lim], "k--", lw=1, label=r"$|residual| = \sigma$")
+ax.set_xlabel(r"predicted $\sigma$"); ax.set_ylabel("|residual|")
+ax.set_title("does the predicted uncertainty track the actual error?", fontsize=9)
+ax.legend(fontsize=8); plt.show()
+
+#%% md
+**Our model fails this test, and it fails it badly enough to be interesting.**
+
+The predicted $\sigma$ rises steadily across the three groups — the model is
+confident it knows which events are hard. The actual RMSE does not follow. On
+this run it is essentially flat, or even *decreasing*: the events the model
+flagged as most uncertain are measured about as well as the ones it flagged as
+easiest.
+
+So we have a model whose uncertainties are, after recalibration, **correct on
+average and useless per event**. Both statements are true simultaneously, and
+that is the point of doing both tests:
+
+- the **pull test** checks the *marginal* distribution of the errors — are the
+  error bars the right size overall?
+- the **ranking test** checks the *conditional* structure — does $\sigma$ know
+  which specific events are hard?
+
+**Post-hoc recalibration can only ever fix the first.** A global shift and scale
+move the whole pull distribution; they cannot reorder events. If the ranking is
+wrong, no amount of calibration will make a per-event error bar meaningful, and
+quoting one would be actively misleading — you would be attaching a large
+uncertainty to well-measured events and a small one to badly-measured ones.
+
+The likely cause here is the same one behind the original miscalibration: 1000
+training events is not much, and $\log\sigma^2$ is a harder thing to learn than
+$\mu$ — it is estimated from the *spread* of residuals, which needs far more data
+than the mean does. Exercise 1's larger training sets are the first thing to try;
+an ensemble, whose member-to-member spread adds an epistemic term the single
+heteroscedastic head cannot represent, is the second.
+
+> **The general lesson.** "My uncertainties are calibrated" is a weaker claim than
+> it sounds. Always ask *calibrated in what sense* — on average, or per event?
+> Only the second lets you weight events individually in a fit.
+
+## 7. What to do in practice
+
+A short recipe, in order.
+
+1. **Always hold out a calibration set**, separate from training and from the
+   test set you quote. A few thousand events is plenty.
+2. **Plot the reliability diagram before you trust any probability.** ECE is a
+   summary; the diagram shows you the high-confidence bins your analysis actually
+   uses.
+3. **Temperature-scale by default.** One parameter, no accuracy cost, large NLL
+   improvement. There is no good reason not to.
+4. **For regression, plot the pull.** Mean, width, and *shape*. Recalibrate with
+   a shift and a scale on held-out data; if the tails matter, calibrate the
+   quantile you care about instead of the width.
+5. **Recalibrate per domain.** Simulation and data need different constants. Your
+   labelled control sample is where they come from.
+6. **Ensemble if you can afford it, but make the members different.** Different
+   data subsets, architectures, or hyperparameters — not just different seeds.
+7. **Use ensemble disagreement as a shift alarm**, not as a p-value.
+
+And the caveat that a physicist should hear explicitly:
+
+> **None of this produces a statistical uncertainty in the frequentist sense you
+> would defend in a paper.** A calibrated network output is a well-behaved
+> summary statistic whose distribution you have checked on a particular sample.
+> It is not a likelihood, and its "uncertainty" does not automatically cover
+> mis-modelling in your simulation, detector effects you did not simulate, or
+> your choice of architecture. Those remain systematic uncertainties that you
+> estimate the way you always have — by varying the thing and re-running. What
+> calibration buys you is that the *statistical* part is not silently wrong, and
+> that your network's outputs can enter a fit without poisoning it.
+
+## 8. Takeaways
+
+1. **A softmax output is not a probability** until you have checked it. Modern
+   networks are systematically overconfident, and the effect grew as
+   architectures improved.
+2. **Reliability diagram first, ECE second.** The summary hides the
+   high-confidence bins you actually cut on.
+3. **Temperature scaling is one parameter, free, and leaves accuracy exactly
+   unchanged.** Make it a default step.
+4. **Calibration is a property of the model *and* the distribution.** A
+   temperature fitted on simulation does not calibrate you on data — which is
+   precisely what labelled control samples are for.
+5. **Ensembles help only when the members are diverse.** Five seeds on identical
+   data bought us nothing; five different subsets cut ECE fourfold and improved
+   accuracy.
+6. **Ensemble disagreement rises out of distribution** where a single model's
+   confidence does not. A cheap alarm bell, not a test.
+7. **For regression, predict $\sigma$ and check the pull.** Ours came out biased
+   by 1.3 and 85 % too wide; two parameters fixed the moments — but the pull was
+   still non-Gaussian, and $\sigma$ did **not** track which events were actually
+   hard. Post-hoc calibration fixes the marginal distribution, never the
+   per-event ranking.
+8. **Statistical calibration is not systematic uncertainty**, and no amount of
+   post-hoc scaling covers simulation mis-modelling.
+
+## 9. Exercises
+
+1. **Does calibration survive more data?** Retrain the classifier with 400, 1000
+   and 4000 events and plot ECE and the fitted $T$ against training-set size.
+   Which of the two sources of overconfidence — aleatoric or epistemic — does
+   more data remove? Then do the same for the regressor of §6 and check whether
+   the $\sigma$-ranking test starts to pass.
+2. **Label smoothing.** Train with `F.cross_entropy(..., label_smoothing=0.05)`.
+   It should improve calibration directly, without a post-hoc step. What does it
+   cost?
+3. **Per-class temperatures.** Fit three temperatures instead of one and check on
+   a held-out set whether the extra parameters help or overfit.
+4. **Calibrate a cut.** Choose the threshold that should give 90 % efficiency on
+   the shower class according to the uncalibrated scores, then measure the actual
+   efficiency. Repeat with calibrated scores. This is the mistake in its natural
+   habitat.
+5. **How many ensemble members?** Sweep $K$ from 1 to 10 with the
+   different-data-per-member recipe and plot ECE against $K$. Where does it
+   saturate, and is the compute better spent on more members or more data per
+   member?
+6. **Non-Gaussian pulls.** Fit a Student's $t$ to the pull distribution in §6.
+   How many degrees of freedom? Now recalibrate the 95 % quantile directly and
+   compare with the width-matching approach.
+7. **Segmentation calibration.** Everything here was event-level. Repeat the
+   reliability analysis per *pixel* for the U-Net of Notebook 1. Are the pixels
+   near a track/shower boundary as badly calibrated as you would expect?

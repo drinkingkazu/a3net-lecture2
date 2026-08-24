@@ -1,0 +1,734 @@
+#%% md
+# Lecture 2 · Notebook 6 — Sparse convolutions: keeping the grid, skipping the zeros
+
+**ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
+
+*Extra notebook. **This one does not run on stock Colab.***
+
+---
+
+> ### ⚠ Requirements
+>
+> This notebook needs **MinkowskiEngine**, which is a compiled CUDA extension
+> that must match your exact PyTorch and CUDA versions. Installing it on Colab is
+> a fragile 15-minute source build that breaks whenever Colab updates its images,
+> which is why the main lecture discusses sparse convolutions but does not run
+> them.
+>
+> **Your lecturer can provide a container image with MinkowskiEngine already
+> installed.** Run this notebook there:
+>
+> ```bash
+> apptainer exec --nv <image>.sif jupyter lab
+> ```
+>
+> If you would rather set it up yourself, try **[spconv](https://github.com/traveller59/spconv)**
+> first — it ships prebuilt wheels for common CUDA versions and is much less
+> painful than building
+> [MinkowskiEngine](https://github.com/NVIDIA/MinkowskiEngine) from source. The
+> concepts below are identical in both libraries; only the API names differ.
+
+### Where we are
+
+Notebook 0 measured the problem: our detector images are ~97 % empty, so a dense
+convolution spends ~97 % of its arithmetic and activation memory multiplying
+zeros by weights. Notebook 3 took one way out — abandon the grid entirely and
+treat the event as a point cloud or graph. That worked, but it cost us
+something: we had to hand-build a k-NN graph to recover the locality that the
+pixel grid had given us for free, and our naive implementation was slower and
+more memory-hungry than the CNN it replaced.
+
+This notebook takes the *other* way out, and for grid-structured detector data it
+is usually the better one:
+
+> **Keep the convolution. Keep the grid. Keep every intuition from Notebook 1.
+> Just do not store, or compute at, the empty sites.**
+
+A sparse convolution applies exactly the same kernel with exactly the same weight
+sharing and exactly the same translation equivariance as `nn.Conv2d`. Receptive
+fields, U-Nets, BatchNorm, residual connections — all unchanged. The only
+difference is the bookkeeping underneath.
+
+This is the standard tool in LArTPC reconstruction. It is how experiments run
+U-Nets over full detector volumes that could never be held densely in memory.
+
+### What you will do
+
+1. Build a sparse tensor and see what it actually stores.
+2. Meet the failure mode that makes naive sparse convolution useless — **dilation
+   of the active region** — and the fix: **submanifold** convolution.
+3. Train a sparse classifier and compare it against the dense CNN: same
+   parameters, same accuracy, a fraction of the memory.
+4. Build a sparse **U-Net** for per-pixel semantic segmentation — the actual
+   LArTPC application.
+5. Measure the argument that decides the matter: **how each approach scales as
+   the detector grows.**
+
+**Runtime:** roughly 5 minutes on a modern GPU.
+
+#%% md
+## 0. Setup
+
+#%% setup
+
+#%% code
+import time
+import gc
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+try:
+    import MinkowskiEngine as ME
+except ImportError:
+    raise SystemExit(
+        "MinkowskiEngine is not installed. See the requirements box at the top "
+        "of this notebook -- run this in the provided container, or install "
+        "spconv and adapt the API names."
+    )
+
+torch.manual_seed(0)
+np.random.seed(0)
+assert torch.cuda.is_available(), "MinkowskiEngine needs a GPU."
+DEVICE = "cuda"
+print("MinkowskiEngine", ME.__version__, "| torch", torch.__version__)
+print("GPU:", torch.cuda.get_device_name(0))
+
+#%% code
+train = ms.generate_dataset(3000, seed=0, progress=True)
+val   = ms.generate_dataset(800, seed=1)
+CHARGE_SCALE = float(np.percentile(train["image"][train["image"] > 0], 99))
+Ytr, Yva = torch.tensor(train["label"]), torch.tensor(val["label"])
+ms.summarize(train, "train")
+
+#%% md
+## 1. What a sparse tensor stores
+
+A `SparseTensor` is two arrays and nothing else:
+
+- **coordinates** — an integer array of shape $(\text{n active sites}, 1 + d)$.
+  The leading column is the **batch index**; the rest are the site's integer
+  coordinates on the grid. This is exactly "Option B" from Notebook 3 —
+  concatenate everything and carry a batch index — now applied to grid data.
+- **features** — a float array of shape $(\text{n active sites}, C)$: the channel
+  values at those sites.
+
+Nothing records where the zeros are, because there is nothing to record. The grid
+is implicit in the integer coordinates.
+
+#%% code
+def to_sparse_list(ds, scale=CHARGE_SCALE, with_labels=False):
+    """Dense images -> per-event (integer coordinates, features[, point labels])."""
+    out = []
+    for i in range(len(ds["image"])):
+        if with_labels:
+            c, f, l = ms.to_points(ds["image"][i], ds["seg"][i])
+            out.append((torch.tensor(c, dtype=torch.int32),
+                        torch.tensor(f / scale), torch.tensor(l)))
+        else:
+            c, f = ms.to_points(ds["image"][i])
+            out.append((torch.tensor(c, dtype=torch.int32), torch.tensor(f / scale)))
+    return out
+
+
+sp_train = to_sparse_list(train)
+sp_val   = to_sparse_list(val)
+
+
+def make_batch(items, idx, device=DEVICE):
+    # sparse_collate concatenates the events into ONE list of sites and prepends a
+    # batch column, so coordinates come back as (total_sites, 1 + 2) = [b, x, y].
+    # That leading column is what keeps events from leaking into each other: a
+    # convolution never treats sites with different b as neighbours.
+    coords, feats = ME.utils.sparse_collate([items[i][0] for i in idx],
+                                            [items[i][1] for i in idx])
+    return ME.SparseTensor(features=feats.float().to(device),   # (total_sites, C)
+                           coordinates=coords.to(device))       # (total_sites, 3)
+
+
+x = make_batch(sp_train, range(32))
+print(f"a batch of 32 events")
+print(f"  coordinates {tuple(x.C.shape)}   dtype {x.C.dtype}   "
+      f"[batch, x, y]")
+print(f"  features    {tuple(x.F.shape)}")
+print(f"\nfirst five rows:")
+for k in range(5):
+    print(f"   batch={int(x.C[k, 0])}  x={int(x.C[k, 1]):>3}  y={int(x.C[k, 2]):>3}"
+          f"   charge={float(x.F[k, 0]):.3f}")
+dense_equiv = 32 * ms.SIZE * ms.SIZE
+print(f"\n  active sites stored {x.C.shape[0]:>10,}")
+print(f"  a dense tensor would hold {dense_equiv:>6,}"
+      f"   ({100 * x.C.shape[0] / dense_equiv:.1f} %)")
+
+#%% md
+## 2. The failure mode: dilation
+
+Here is the thing that makes a naive sparse convolution useless, and it is worth
+understanding before you write any code.
+
+Apply a $3\times3$ kernel to a single isolated active site. The kernel has a
+non-zero response at all nine neighbouring positions — so the output has **nine**
+active sites where the input had one. Do it again and you have 25. Your carefully
+sparse event inflates towards dense, and after a handful of layers you have
+gained nothing at all.
+
+The fix is the **submanifold sparse convolution** (Graham & van der Maaten): the
+output is computed *only at sites that were already active in the input*. The
+kernel still reads from all neighbours, so information still flows; it simply is
+not written to previously-empty positions. Sparsity is then preserved **exactly**,
+through arbitrary depth.
+
+In MinkowskiEngine, a stride-1 `MinkowskiConvolution` is submanifold by default,
+and `expand_coordinates=True` gives you the dilating version. Let us watch both.
+
+#%% code
+x = make_batch(sp_train, range(32))
+depth = 6
+counts = {}
+for tag, kwargs in [("submanifold (default)", {}),
+                    ("expanding", dict(expand_coordinates=True))]:
+    layers = [ME.MinkowskiConvolution(1 if i == 0 else 8, 8, kernel_size=3,
+                                      dimension=2, **kwargs).to(DEVICE)
+              for i in range(depth)]
+    h = x
+    n = [h.C.shape[0]]
+    with torch.no_grad():
+        for layer in layers:
+            h = layer(h)
+            n.append(h.C.shape[0])
+    counts[tag] = n
+    print(f"{tag:24s} " + " -> ".join(f"{v:,}" for v in n))
+
+fig, ax = plt.subplots(figsize=(6.5, 4))
+for tag, n in counts.items():
+    ax.plot(range(len(n)), n, "o-", label=tag)
+ax.set_yscale("log")
+ax.set_xlabel("convolution layer"); ax.set_ylabel("active sites in a batch of 32")
+ax.set_title("why 'submanifold' matters", fontsize=10)
+ax.legend(); ax.grid(alpha=0.3, which="both")
+plt.show()
+
+del h, layers
+gc.collect(); torch.cuda.empty_cache()
+
+print(f"\nafter {depth} layers the expanding version has "
+      f"{counts['expanding'][-1] / counts['submanifold (default)'][-1]:.0f}x "
+      f"more active sites")
+
+#%% md
+The submanifold line is perfectly flat. The expanding line grows by more than an
+order of magnitude in six layers, and would keep going.
+
+**The trade-off**, stated honestly: submanifold convolutions never propagate
+information into empty space. Two track fragments separated by a gap of empty
+pixels can never communicate, no matter how many submanifold layers you stack —
+their receptive fields grow but the active sites do not connect. The standard
+remedy is the same one a dense CNN uses: **downsample**. A strided convolution or
+pooling layer merges nearby sites onto a coarser grid, which both grows the
+receptive field and brings separated fragments into contact.
+
+So the usual recipe is: submanifold convolutions to build features, ordinary
+strided convolutions or pooling to move between resolutions. Which is exactly the
+structure of the U-Net from Notebook 1.
+
+## 3. A sparse classifier
+
+Now build the same 4-block classifier we have used all lecture, in sparse form.
+Compare the code with `make_cnn` from Notebook 3 — it is a one-for-one
+substitution:
+
+| dense | sparse |
+|---|---|
+| `nn.Conv2d(a, b, 3, padding=1)` | `ME.MinkowskiConvolution(a, b, 3, dimension=2)` |
+| `nn.BatchNorm2d(b)` | `ME.MinkowskiBatchNorm(b)` |
+| `nn.ReLU()` | `ME.MinkowskiReLU()` |
+| `nn.MaxPool2d(2)` | `ME.MinkowskiMaxPooling(2, stride=2, dimension=2)` |
+| `nn.AdaptiveMaxPool2d(1)` | `ME.MinkowskiGlobalMaxPooling()` |
+
+Note there is no `padding` argument to think about — with no dense array there is
+no boundary to pad. (Which quietly removes one of the three translation-symmetry
+leaks we measured in Notebook 0.)
+
+#%% code
+D = 2  # spatial dimensions; set to 3 for a real 3D detector and nothing else changes
+
+
+def sparse_block(cin, cout):
+    return nn.Sequential(
+        ME.MinkowskiConvolution(cin, cout, kernel_size=3, dimension=D),
+        ME.MinkowskiBatchNorm(cout), ME.MinkowskiReLU(),
+        ME.MinkowskiConvolution(cout, cout, kernel_size=3, dimension=D),
+        ME.MinkowskiBatchNorm(cout), ME.MinkowskiReLU(),
+        ME.MinkowskiMaxPooling(kernel_size=2, stride=2, dimension=D))
+
+
+class SparseNet(nn.Module):
+    def __init__(self, ch=24, n_classes=3):
+        super().__init__()
+        self.net = nn.Sequential(sparse_block(1, ch), sparse_block(ch, ch),
+                                 sparse_block(ch, ch), sparse_block(ch, ch))
+        self.pool = ME.MinkowskiGlobalMaxPooling()
+        self.head = nn.Linear(ch, n_classes)
+
+    def forward(self, x):
+        return self.head(self.pool(self.net(x)).F)
+
+
+def dense_block(cin, cout):
+    return nn.Sequential(
+        nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(),
+        nn.Conv2d(cout, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(),
+        nn.MaxPool2d(2))
+
+
+def make_dense(ch=24):
+    return nn.Sequential(dense_block(1, ch), dense_block(ch, ch),
+                         dense_block(ch, ch), dense_block(ch, ch),
+                         nn.AdaptiveMaxPool2d(1), nn.Flatten(), nn.Linear(ch, 3))
+
+
+print(f"sparse parameters {sum(p.numel() for p in SparseNet().parameters()):,}")
+print(f"dense  parameters {sum(p.numel() for p in make_dense().parameters()):,}")
+
+#%% code
+def mem_baseline():
+    """Peak-memory bookkeeping.
+
+    `max_memory_allocated` is a process-wide high-water mark, so anything still
+    resident from an earlier cell would be counted against whichever model we
+    happen to measure next. We record the baseline and report the *increment*,
+    which is the only number that means anything in a shared process.
+    """
+    gc.collect(); torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    return torch.cuda.memory_allocated()
+
+
+def mem_used(base):
+    return (torch.cuda.max_memory_allocated() - base) / 1e6
+
+
+def train_sparse(epochs=6, bs=64, lr=2e-3):
+    torch.manual_seed(0)
+    model = SparseNet().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    base = mem_baseline()
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = torch.randperm(len(sp_train))
+        for i in range(0, len(perm), bs):
+            idx = perm[i:i + bs].tolist()
+            opt.zero_grad()
+            F.cross_entropy(model(make_batch(sp_train, idx)),
+                            Ytr[idx].to(DEVICE)).backward()
+            opt.step()
+    secs, mem = time.time() - t0, mem_used(base)
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for i in range(0, len(sp_val), 64):
+            idx = list(range(i, min(i + 64, len(sp_val))))
+            correct += (model(make_batch(sp_val, idx)).argmax(1).cpu()
+                        == Yva[idx]).sum().item()
+    return correct / len(sp_val), secs, mem
+
+
+def train_dense(epochs=6, bs=64, lr=2e-3):
+    X = torch.tensor(train["image"])[:, None] / CHARGE_SCALE
+    XV = torch.tensor(val["image"])[:, None] / CHARGE_SCALE
+    torch.manual_seed(0)
+    model = make_dense().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    base = mem_baseline()
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = torch.randperm(len(X))
+        for i in range(0, len(perm), bs):
+            b = perm[i:i + bs]
+            opt.zero_grad()
+            F.cross_entropy(model(X[b].to(DEVICE)), Ytr[b].to(DEVICE)).backward()
+            opt.step()
+    secs, mem = time.time() - t0, mem_used(base)
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for i in range(0, len(XV), 128):
+            correct += (model(XV[i:i + 128].to(DEVICE)).argmax(1).cpu()
+                        == Yva[i:i + 128]).sum().item()
+    return correct / len(XV), secs, mem
+
+
+d_acc, d_s, d_m = train_dense()
+s_acc, s_s, s_m = train_sparse()
+
+print(f"{'':8}{'accuracy':>10}{'train s':>10}{'peak MB':>10}")
+print("-" * 38)
+print(f"{'dense':8}{d_acc:>10.3f}{d_s:>10.0f}{d_m:>10.0f}")
+print(f"{'sparse':8}{s_acc:>10.3f}{s_s:>10.0f}{s_m:>10.0f}")
+print(f"\nmemory saving: {d_m / s_m:.0f}x")
+
+#%% md
+**Same accuracy, essentially the same parameters, an order of magnitude less
+memory.** That is the whole pitch, and it is not a trade-off — nothing was given
+up. The network is computing the same function class; only the sites at which it
+computes have changed.
+
+Wall-clock is the less predictable column. Sparse convolutions pay an overhead
+that dense ones do not — gathering scattered sites and maintaining a coordinate
+hash map, against a dense convolution that is a beautifully optimised matrix
+multiply. Whether the arithmetic saved beats that overhead depends on your
+occupancy, your channel counts and your GPU, so **treat the timing number here as
+specific to this hardware** and measure it on yours. At 2.5 % occupancy the
+saving usually wins even at this modest size.
+
+The memory column, by contrast, is structural: it follows directly from not
+storing the zeros, and it will hold on any hardware.
+
+Hold both thoughts until §5, where we make the detector bigger and the
+comparison stops being close.
+
+## 4. A sparse U-Net for segmentation
+
+Classification only needed a downsampling path. The real LArTPC application is
+**per-pixel semantic segmentation** — labelling every hit as track or shower —
+which needs the U-Net from Notebook 1: down for context, up for resolution, skip
+connections to carry the detail.
+
+All three pieces have sparse equivalents. The one to note is
+`MinkowskiConvolutionTranspose` for upsampling, and `ME.cat` for the skip
+concatenation. Because the coordinate manager tracks which coarse site came from
+which fine sites, the skip connections line up automatically — you do not have to
+match shapes by hand as you would with dense `F.interpolate`.
+
+#%% code
+def sm_block(cin, cout):
+    """Two submanifold convolutions. Sparsity pattern unchanged."""
+    return nn.Sequential(
+        ME.MinkowskiConvolution(cin, cout, kernel_size=3, dimension=D),
+        ME.MinkowskiBatchNorm(cout), ME.MinkowskiReLU(),
+        ME.MinkowskiConvolution(cout, cout, kernel_size=3, dimension=D),
+        ME.MinkowskiBatchNorm(cout), ME.MinkowskiReLU())
+
+
+class SparseUNet(nn.Module):
+    def __init__(self, ch=16, n_classes=3):
+        super().__init__()
+        self.enc1 = sm_block(1, ch)
+        self.down1 = ME.MinkowskiConvolution(ch, ch, kernel_size=2, stride=2, dimension=D)
+        self.enc2 = sm_block(ch, 2 * ch)
+        self.down2 = ME.MinkowskiConvolution(2 * ch, 2 * ch, kernel_size=2, stride=2,
+                                             dimension=D)
+        self.enc3 = sm_block(2 * ch, 4 * ch)
+        self.up2 = ME.MinkowskiConvolutionTranspose(4 * ch, 2 * ch, kernel_size=2,
+                                                    stride=2, dimension=D)
+        self.dec2 = sm_block(4 * ch, 2 * ch)
+        self.up1 = ME.MinkowskiConvolutionTranspose(2 * ch, ch, kernel_size=2,
+                                                    stride=2, dimension=D)
+        self.dec1 = sm_block(2 * ch, ch)
+        self.out = ME.MinkowskiConvolution(ch, n_classes, kernel_size=1, dimension=D)
+
+    def forward(self, x):
+        # Same U-Net shape as Notebook 1, but "resolution" now means the stride of
+        # the coordinate grid rather than the size of an array.
+        a = self.enc1(x)                          # stride 1  (finest sites)
+        b = self.enc2(self.down1(a))              # stride 2
+        c = self.enc3(self.down2(b))              # stride 4  (coarsest)
+
+        # ME.cat is the sparse analogue of torch.cat along channels. It can only
+        # concatenate tensors defined on the SAME coordinates -- and they are,
+        # because the coordinate manager remembers which fine sites produced each
+        # coarse one, so up2(c) lands exactly back on b's sites. This is the piece
+        # of bookkeeping you would have to do by hand with dense interpolation.
+        h = self.dec2(ME.cat(self.up2(c), b))     # back to stride 2
+        h = self.dec1(ME.cat(self.up1(h), a))     # back to stride 1
+        return self.out(h)                        # one logit vector per input site
+
+
+sp_train_seg = to_sparse_list(train, with_labels=True)
+sp_val_seg   = to_sparse_list(val, with_labels=True)
+
+
+def make_seg_batch(items, idx):
+    coords, feats = ME.utils.sparse_collate([items[i][0] for i in idx],
+                                            [items[i][1] for i in idx])
+    labels = torch.cat([items[i][2] for i in idx])
+    return (ME.SparseTensor(features=feats.float().to(DEVICE),
+                            coordinates=coords.to(DEVICE)), labels.to(DEVICE))
+
+
+x, y = make_seg_batch(sp_train_seg, range(4))
+out = SparseUNet().to(DEVICE)(x)
+print(f"input  sites {x.C.shape[0]:,}")
+print(f"output sites {out.C.shape[0]:,}   features {tuple(out.F.shape)}")
+print(f"labels       {tuple(y.shape)}")
+print(f"coordinates preserved end to end: "
+      f"{bool((out.C == x.C).all())}")
+print("\n=> the loss is an ordinary cross-entropy over out.F and y.")
+
+#%% md
+Note what that last line means. Sparse segmentation trains **only on the hits that
+exist**. A dense U-Net computes a loss at all 9216 pixels per event, of which
+~97 % are empty background — the enormous class imbalance we fought with in
+Notebook 1. Here those pixels are not merely down-weighted, they are *absent*,
+and the imbalance shrinks from 98:2 to whatever the ratio is among real hits.
+
+That is a genuine second benefit of the sparse representation, and it is easy to
+miss: **it changes the problem, not just the cost.**
+
+#%% code
+def train_sparse_unet(epochs=4, bs=32, lr=2e-3):
+    torch.manual_seed(0)
+    model = SparseUNet().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    base = mem_baseline()
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = torch.randperm(len(sp_train_seg))
+        for i in range(0, len(perm), bs):
+            idx = perm[i:i + bs].tolist()
+            x, y = make_seg_batch(sp_train_seg, idx)
+            opt.zero_grad()
+            F.cross_entropy(model(x).F, y).backward()
+            opt.step()
+    secs, peak = time.time() - t0, mem_used(base)
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for i in range(0, len(sp_val_seg), bs):
+            idx = list(range(i, min(i + bs, len(sp_val_seg))))
+            x, y = make_seg_batch(sp_val_seg, idx)
+            preds.append(model(x).F.argmax(1).cpu()); trues.append(y.cpu())
+    return torch.cat(preds), torch.cat(trues), secs, model, peak
+
+
+pred, true, secs, unet, peak = train_sparse_unet()
+print(f"trained in {secs:.0f} s, peak {peak:.0f} MB")
+print(f"\n{'class':<12}{'IoU':>8}{'recall':>10}{'precision':>12}   "
+      f"(over HITS only, not pixels)")
+for c in range(3):
+    p, t = (pred == c), (true == c)
+    inter = (p & t).sum().item()
+    if t.sum() == 0:
+        continue
+    print(f"{ms.SEG_NAMES[c]:<12}{inter / max((p | t).sum().item(), 1):>8.3f}"
+          f"{inter / max(t.sum().item(), 1):>10.3f}"
+          f"{inter / max(p.sum().item(), 1):>12.3f}")
+print(f"\nhit-level class balance: " + ", ".join(
+    f"{ms.SEG_NAMES[c]}={(true == c).float().mean():.3f}" for c in range(3)))
+
+#%% code
+# visualise: scatter the predicted label at each active site
+from matplotlib.colors import ListedColormap
+
+idx = list(range(6))
+x, y = make_seg_batch(sp_val_seg, idx)
+unet.eval()
+with torch.no_grad():
+    p = unet(x).F.argmax(1).cpu()
+coords = x.C.cpu()
+fig, axes = plt.subplots(2, len(idx), figsize=(2.1 * len(idx), 4.6))
+for k in idx:
+    sel = coords[:, 0] == k
+    for row, lab in [(0, y.cpu()[sel]), (1, p[sel])]:
+        ax = axes[row, k]
+        ax.scatter(coords[sel, 1], coords[sel, 2], c=lab, s=4,
+                   cmap=ListedColormap(ms.SEG_COLORS), vmin=0, vmax=2)
+        ax.set_xlim(0, ms.SIZE); ax.set_ylim(0, ms.SIZE)
+        ax.set_aspect("equal"); ax.set_facecolor("#101418")
+        ax.set_xticks([]); ax.set_yticks([])
+axes[0, 0].set_ylabel("truth", fontsize=9)
+axes[1, 0].set_ylabel("sparse U-Net", fontsize=9)
+fig.tight_layout(); plt.show()
+
+#%% md
+## 5. The argument that actually decides it: scaling
+
+At $96\times96$ the sparse version saved memory and cost a little time. That is a
+mildly interesting engineering result. The reason sparse convolutions are the
+standard tool is what happens when the detector gets **bigger**.
+
+A dense convolution's cost grows with the **number of pixels**, i.e. as the
+volume. A sparse convolution's cost grows with the **number of hits**. For a
+detector recording particle trajectories, those scale completely differently:
+double the linear size and the volume goes up 4× (8× in 3D) while a track
+crossing it gets only ~2× longer.
+
+Let us measure it. One forward+backward pass, batch of 32, at increasing detector
+size.
+
+#%% code
+def bench(size, batch=32, ch=24):
+    ds = ms.generate_dataset(batch, seed=0, size=size, jitter=size / 12)
+    y = torch.randint(0, 3, (batch,)).to(DEVICE)
+    hits = int((ds["image"] > 0).sum())
+    scale = float(np.percentile(ds["image"][ds["image"] > 0], 99))
+
+    # --- dense
+    base = mem_baseline()
+    try:
+        model = make_dense(ch).to(DEVICE)
+        X = torch.tensor(ds["image"])[:, None].to(DEVICE) / scale
+        for _ in range(3):
+            F.cross_entropy(model(X), y).backward()
+        torch.cuda.synchronize(); t0 = time.time()
+        for _ in range(5):
+            F.cross_entropy(model(X), y).backward()
+        torch.cuda.synchronize()
+        d_ms = (time.time() - t0) / 5 * 1000
+        d_mb = mem_used(base)
+        del model, X
+    except torch.cuda.OutOfMemoryError:
+        d_ms, d_mb = float("nan"), float("nan")
+
+    # --- sparse
+    base = mem_baseline()
+    items = to_sparse_list(ds, scale=scale)
+    model = SparseNet(ch).to(DEVICE)
+    for _ in range(3):
+        F.cross_entropy(model(make_batch(items, range(batch))), y).backward()
+    torch.cuda.synchronize(); t0 = time.time()
+    for _ in range(5):
+        F.cross_entropy(model(make_batch(items, range(batch))), y).backward()
+    torch.cuda.synchronize()
+    s_ms = (time.time() - t0) / 5 * 1000
+    s_mb = mem_used(base)
+    del model
+    ME.clear_global_coordinate_manager()
+    return hits, d_mb, d_ms, s_mb, s_ms
+
+
+print(f"{'size':>7}{'pixels':>12}{'hits':>9}{'occ%':>7}"
+      f"{'dense MB':>11}{'dense ms':>10}{'sparse MB':>11}{'sparse ms':>11}")
+print("-" * 78)
+rows = []
+for size in (96, 192, 384, 768):
+    hits, d_mb, d_ms, s_mb, s_ms = bench(size)
+    px = 32 * size * size
+    rows.append((size, px, hits, d_mb, d_ms, s_mb, s_ms))
+    print(f"{size:>7}{px:>12,}{hits:>9,}{100 * hits / px:>7.2f}"
+          f"{d_mb:>11.0f}{d_ms:>10.1f}{s_mb:>11.0f}{s_ms:>11.1f}")
+
+#%% code
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+sizes = [r[0] for r in rows]
+for ax, (di, si, lab) in zip(axes, [(3, 5, "peak memory [MB]"),
+                                    (4, 6, "time per step [ms]")]):
+    ax.loglog(sizes, [r[di] for r in rows], "o-", label="dense")
+    ax.loglog(sizes, [r[si] for r in rows], "s-", label="sparse")
+    ax.set_xlabel("detector linear size [pixels]"); ax.set_ylabel(lab)
+    ax.grid(alpha=0.3, which="both"); ax.legend()
+fig.suptitle("dense cost grows with volume; sparse cost grows with hits", y=1.02)
+fig.tight_layout(); plt.show()
+
+print(f"at {sizes[-1]}x{sizes[-1]}:  "
+      f"memory {rows[-1][3] / rows[-1][5]:.0f}x less,  "
+      f"time {rows[-1][4] / rows[-1][6]:.0f}x less")
+
+#%% md
+That is the argument.
+
+The dense curves are straight lines of slope 2 on a log-log plot: cost
+$\propto$ area, exactly as expected. The sparse curves are **almost flat** —
+because in this simulation the number of hits per event grows only slowly as the
+detector grows, while the number of pixels grows as the square.
+
+Read the honest caveat in the `hits` column: the hit count is not perfectly
+constant, it creeps up. Sparse cost tracks *that* column, and it grows roughly
+linearly in the number of hits. The win is not that sparse is free; it is that
+sparse costs what your **data** costs, while dense costs what your **grid** costs.
+For a detector, those diverge fast — and in 3D they diverge much faster than the
+2D example here, because volume grows as the cube while a track's length grows
+linearly.
+
+At the largest size, the dense model needs several gigabytes for a batch of 32
+and would not fit alongside a realistic model on a 16 GB GPU. The sparse model
+needs tens of megabytes. This is not an optimisation; it is the difference between
+a project that is possible and one that is not.
+
+## 6. Practical notes
+
+Things that will bite you, collected in one place.
+
+**Coordinates must be integers**, and they define the grid. If your detector has
+non-integer hit positions, you must **quantise** — and the quantisation size is a
+physics choice, exactly like a histogram bin width. `ME.utils.sparse_quantize`
+does this and also handles the case below.
+
+**Duplicate coordinates.** After quantisation, two hits can land on the same
+site. MinkowskiEngine will not silently sum them; you must decide (sum the
+charge? take the max? average?) and tell it. Silent surprises here are a common
+source of "my sparse model disagrees with my dense model".
+
+**Memory of the coordinate manager.** MinkowskiEngine caches coordinate maps
+between strides. In a long training loop this can accumulate; call
+`ME.clear_global_coordinate_manager()` periodically, or between phases, if you
+see memory creep that the model itself cannot explain.
+
+**Batch size interacts with sparsity.** Because cost tracks hits, a batch of
+busy events costs more than a batch of quiet ones. Fixed batch sizes give
+variable memory. For very large events, batch by *total hits* rather than by
+event count.
+
+**3D is a one-character change.** Every layer above takes `dimension=D`. Set
+`D = 3`, feed $(x, y, z)$ coordinates, and everything works. This is where sparse
+convolutions really pay: at 97 % emptiness in 2D the saving is ~40×; a 3D
+detector is typically 99.9 % empty.
+
+**Not everything has a sparse equivalent.** Operations that need dense
+neighbourhoods (some attention variants, some normalisations) need thought.
+Layer-wise, though, the standard toolkit — convolution, transpose convolution,
+pooling, BatchNorm, ReLU, global pooling — is all there.
+
+**spconv vs MinkowskiEngine.** Same concepts, different API. spconv distinguishes
+`SparseConv3d` (dilating) from `SubMConv3d` (submanifold) explicitly by class
+name, which is arguably clearer than MinkowskiEngine's `expand_coordinates` flag.
+spconv is much easier to install and is actively maintained; MinkowskiEngine has
+broader use in some physics codebases. Learn one, and the other takes an hour.
+
+## 7. Takeaways
+
+1. **A sparse convolution is the same convolution.** Same weights, same weight
+   sharing, same translation equivariance, same receptive-field arithmetic. Only
+   the storage and the set of evaluated sites change.
+2. **Naive sparse convolutions dilate the active region** and destroy the
+   sparsity they were meant to exploit — an order of magnitude in six layers.
+   **Submanifold** convolutions keep the sparsity pattern exactly fixed.
+3. **Submanifold layers cannot bridge empty space.** Use strided convolutions or
+   pooling to grow the receptive field and connect separated fragments — i.e.
+   build a U-Net.
+4. **At fixed detector size you save memory, roughly break even on time.**
+5. **As the detector grows, dense cost tracks the volume and sparse cost tracks
+   the hits.** That divergence is the real argument, and it is much stronger in
+   3D.
+6. **Sparse segmentation changes the problem**, not just the cost: the loss is
+   evaluated only on real hits, which removes most of the background-class
+   imbalance by construction.
+7. **For grid-structured sparse detector data, this is usually the right answer**
+   — better than a dense CNN on cost, and better than a GNN because you keep the
+   grid, the convolution, and every intuition from Notebook 1.
+
+## 8. Exercises
+
+1. **Go to 3D.** Set `D = 3` and extend the simulator to produce $(x, y, z)$
+   hits. Nothing in `SparseNet` should need to change. Measure the memory saving
+   and compare it with the 2D number.
+2. **Break it deliberately.** Rebuild `SparseNet` with
+   `expand_coordinates=True` everywhere and train it. Track the active-site count
+   per layer during training, and watch memory grow.
+3. **Bridge the gap.** Construct events with two track fragments separated by 5
+   empty pixels, and verify that a pure submanifold stack cannot connect them
+   however deep it is. Then add one pooling layer and show it can.
+4. **Quantisation as a physics choice.** Use `ME.utils.sparse_quantize` with
+   voxel sizes of 1, 2 and 4 pixels. Plot accuracy and cost against voxel size.
+   Where is the knee, and what physical scale does it correspond to?
+5. **Compare all three.** Put the sparse U-Net against the dense U-Net from
+   Notebook 1 and the point-based GNN from Notebook 3, on the same segmentation
+   task, and report accuracy, memory and time. This is the comparison the whole
+   lecture has been building towards — and you now have all three
+   implementations.

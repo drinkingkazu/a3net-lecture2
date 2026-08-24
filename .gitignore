@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+CLAUDE.md
+note.md
+LECTURE_PLAN.md
+pdfs/
+# local tool settings, not part of the course material
+.claude/

@@ -1,0 +1,819 @@
+#%% md
+# Lecture 2 · Notebook 3 — Leaving the grid: sparse data, point clouds and graphs
+
+**ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
+
+---
+
+### Where we are
+
+In Notebook 0 we counted something uncomfortable: our detector images are about
+**97 % empty**, so a dense convolution spends 97 % of its arithmetic and 97 % of
+its activation memory multiplying zeros by weights. We built CNNs anyway, because
+they work and because the grid is convenient.
+
+Now we stop paying for the emptiness. There are two ways out, and they lead to
+genuinely different architectures:
+
+1. **Keep the grid, skip the zeros.** Sparse and submanifold convolutions do
+   exactly what a CNN does, but only at occupied sites. Same inductive bias, a
+   fraction of the cost.
+2. **Abandon the grid.** Treat the event as an unordered **set of points**, each
+   with coordinates and features. This is the honest description of what a
+   detector actually measures — a list of hits — and it is the only option when
+   there is no grid at all: particle lists, jet constituents, sparse 3D
+   trackers, irregular detector geometries.
+
+Option 2 comes with a catch, and the catch is the interesting part. A set has no
+order. If your model's output depends on the order in which you happened to list
+the hits, it is answering a different question from the one you asked. So this
+notebook is really about a second symmetry:
+
+> **Permutation invariance.** Relabelling the points must not change the answer.
+>
+> This is the same kind of statement as translation invariance in Notebook 0, and
+> it earns its place for the same reason: it deletes a large family of wrong
+> answers from the hypothesis space.
+
+### What you will do
+
+1. Confront the practical problem nobody warns you about: **batching data where
+   every example has a different size.**
+2. Show that a naive MLP on a point list is order-dependent, and that this is
+   fatal — its accuracy drops to chance when you shuffle the points.
+3. Build **Deep Sets / PointNet**: per-point processing plus a symmetric
+   aggregation. Permutation invariant by construction.
+4. Add locality back with a **k-nearest-neighbour graph and message passing**,
+   implemented from scratch so you can see the mechanism, then in PyTorch
+   Geometric.
+5. Compare CNN, PointNet and GNN on the same events: accuracy, parameters,
+   memory, wall-clock.
+6. Understand where **sparse convolutions** fit, and when to prefer them.
+
+**Runtime:** roughly 6–9 minutes on a Colab T4.
+
+#%% md
+## 0. Setup
+
+#%% setup
+
+#%% code
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+torch.manual_seed(0)
+np.random.seed(0)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("torch", torch.__version__, "| device:", DEVICE)
+
+#%% code
+train = ms.generate_dataset(4000, seed=0, progress=True)
+val   = ms.generate_dataset(1000, seed=1)
+Ytr, Yva = torch.tensor(train["label"]), torch.tensor(val["label"])
+
+n_hits = np.array([np.count_nonzero(im) for im in train["image"]])
+print(f"hits per event:  min {n_hits.min()}   median {int(np.median(n_hits))}"
+      f"   mean {n_hits.mean():.0f}   95th pct {int(np.percentile(n_hits, 95))}"
+      f"   max {n_hits.max()}")
+
+fig, ax = plt.subplots(figsize=(6, 3))
+ax.hist(n_hits, bins=50, color="#4cc9f0")
+ax.set_xlabel("number of non-zero pixels (hits) in an event")
+ax.set_ylabel("events"); ax.grid(alpha=0.3)
+plt.show()
+
+#%% md
+## 1. The problem nobody warns you about: batching
+
+Look at that histogram. Every event has a **different number of hits** — from ~50
+to ~450. A GPU wants rectangular tensors. This mismatch is the single largest
+source of friction when you move from images to point clouds, and there are two
+standard solutions.
+
+**Option A — pad to a fixed size, and carry a mask.** Every event becomes an
+$N \times 3$ array (`x, y, charge`); events with fewer hits are padded with zeros
+and a boolean mask records which entries are real. Simple, and it keeps
+everything dense and fast. You pay in wasted memory, and you must remember the
+mask **everywhere** — in every sum, every max, every mean. A forgotten mask is
+a silent bug: the model trains, and quietly learns from your padding.
+
+**Option B — concatenate everything and carry a batch index.** Stack all hits
+from all events into one long $(\sum_i M_i) \times 3$ array, plus an integer
+vector saying which event each hit belongs to. Zero waste. Every operation
+becomes a *scatter* over that index vector. This is what PyTorch Geometric does.
+
+Neither is better in general: A is simpler and faster when sizes are similar, B
+is essential when they vary by orders of magnitude. Let us price them.
+
+#%% code
+N_MAX = 384
+
+pad_slots = N_MAX * len(n_hits)
+real_hits = int(np.minimum(n_hits, N_MAX).sum())
+truncated = int((n_hits > N_MAX).mean() * 100)
+
+print(f"Option A: pad/truncate to N = {N_MAX}")
+print(f"  padded slots        {pad_slots:>12,}")
+print(f"  of which real hits  {real_hits:>12,}  ({100 * real_hits / pad_slots:.0f} %)")
+print(f"  wasted on padding   {pad_slots - real_hits:>12,}"
+      f"  ({100 * (1 - real_hits / pad_slots):.0f} %)")
+print(f"  events truncated    {truncated:>11} %  (we throw hits away)")
+print()
+print(f"Option B: concatenate + batch index")
+print(f"  total hits stored   {int(n_hits.sum()):>12,}  (no waste, no truncation)")
+print()
+print(f"and for reference, the dense image representation:")
+print(f"  pixels stored       {len(n_hits) * ms.SIZE * ms.SIZE:>12,}"
+      f"  ({100 * n_hits.sum() / (len(n_hits) * ms.SIZE ** 2):.1f} % occupied)")
+
+#%% md
+Note the honest accounting. Padding wastes a large fraction of the slots, and
+truncation silently discards hits from the busiest events. Both are real costs,
+and **the second one is the dangerous one**: you have introduced a selection bias
+against high-multiplicity events, which in a physics analysis are often exactly
+the interesting ones. It lives in a data-loading function, which is where such
+biases always hide.
+
+`N_MAX` is the knob that trades one cost against the other. We set it near the
+95th percentile: a few percent of events lose hits, and we accept a substantial
+padding overhead in exchange. Exercise 4 asks you to make the wrong choice
+deliberately and measure what it does.
+
+We will use Option A because it keeps the code readable, and we will be careful
+with the mask. Option B appears in §5 via PyTorch Geometric.
+
+#%% code
+def to_point_cloud(ds, n_max=N_MAX, seed=0):
+    """Dense images -> (points, mask). points[i] is (n_max, 3) = (x, y, log-charge).
+
+    Coordinates are centred on the event's charge centroid and scaled, so that
+    absolute position in the detector carries no information -- exactly the
+    translation invariance we fought for in Notebook 0, here for free.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(ds["image"])
+    pts = np.zeros((n, n_max, 3), np.float32)
+    mask = np.zeros((n, n_max), np.float32)
+    for i in range(n):
+        coords, feats = ms.to_points(ds["image"][i])
+        if len(coords) > n_max:
+            keep = rng.choice(len(coords), n_max, replace=False)
+            coords, feats = coords[keep], feats[keep]
+        m = len(coords)                                  # this event's real hit count
+        centroid = (coords * feats).sum(0) / feats.sum() # charge-weighted centre
+        pts[i, :m, :2] = (coords - centroid) / 48.0      # x, y relative to the centroid
+        pts[i, :m, 2] = np.log1p(feats[:, 0]) / 3.0      # log charge, roughly O(1)
+        mask[i, :m] = 1.0                                # slots m: onwards stay padding
+    return torch.tensor(pts), torch.tensor(mask)
+
+
+t0 = time.time()
+Ptr, Mtr = to_point_cloud(train, seed=0)
+Pva, Mva = to_point_cloud(val, seed=1)
+print(f"converted in {time.time() - t0:.1f} s")
+print(f"points {tuple(Ptr.shape)}  mask {tuple(Mtr.shape)}  "
+      f"occupied slots {Mtr.mean():.2f}")
+
+#%% md
+## 2. Why order matters: the naive model
+
+Here is the tempting thing to do. We have $N \times 3$ numbers per event. Flatten
+them into one long vector and feed them to an MLP. It will train. It will even
+work, on the validation set.
+
+We will call this model **`OrderedMLP`**, because the name states the problem: to
+a flattened vector, "the hit in slot 7" is a different input feature from "the
+hit in slot 8". The model necessarily learns a function *of the ordering* of the
+list, not of the set of hits.
+
+And that ordering is an artefact of our storage format — it came from
+`np.nonzero`, which scans the image row by row. It is not physics. Had we written
+the hits out in a different order, which any other reconstruction code might, the
+model's input would change completely while the event stayed identical.
+
+The test is simple: **shuffle the points at evaluation time** and see what
+happens. Physics does not care what order we list the hits in; if the model does,
+the model has learned something that is not physics.
+
+#%% md
+> **Reading the code below.** From here on the tensors get several dimensions, so
+> every line that changes a shape carries a trailing comment giving the result.
+> The symbols are constant throughout:
+>
+> | | |
+> |---|---|
+> | `B` | events in the batch |
+> | `N` | point slots per event (`N_MAX`, including padding) |
+> | `k` | neighbours per point |
+> | `C`, `H` | feature channels |
+>
+> The one idiom worth learning now is `m[..., None]`: it turns the `(B, N)` mask
+> into `(B, N, 1)` so that it *broadcasts* across the channel axis, letting one
+> mask zero out every feature of a padded point at once.
+
+#%% code
+class OrderedMLP(nn.Module):
+    """Flatten the point list. Order-dependent by construction."""
+
+    def __init__(self, n_max=N_MAX):
+        super().__init__()
+        self.f = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(n_max * 3, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 3))
+
+    def forward(self, p, m):
+        return self.f(p * m[..., None])
+
+
+def shuffle_points(p, m):
+    """Randomly permute the point ordering within each event."""
+    # A different permutation per event, so this is not a single global reordering.
+    perm = torch.stack([torch.randperm(p.shape[1], device=p.device)
+                        for _ in range(len(p))])                   # (B, N)
+    # The mask must be permuted with the points, or real hits would acquire
+    # padding flags and vice versa.
+    return (torch.gather(p, 1, perm[..., None].expand(-1, -1, p.shape[-1])),  # (B, N, 3)
+            torch.gather(m, 1, perm))                                          # (B, N)
+
+
+@torch.no_grad()
+def accuracy(model, P, Mk, Y, shuffled=False, bs=128):
+    model.eval()
+    correct = 0
+    for i in range(0, len(P), bs):
+        p, m = P[i:i + bs].to(DEVICE), Mk[i:i + bs].to(DEVICE)
+        if shuffled:
+            p, m = shuffle_points(p, m)
+        correct += (model(p, m).argmax(1).cpu() == Y[i:i + bs]).sum().item()
+    return correct / len(P)
+
+
+def train_points(name, model, epochs=8, lr=2e-3, bs=64):
+    torch.manual_seed(0)
+    model = model.to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = torch.randperm(len(Ptr))
+        for i in range(0, len(perm), bs):
+            b = perm[i:i + bs]
+            opt.zero_grad()
+            loss = F.cross_entropy(model(Ptr[b].to(DEVICE), Mtr[b].to(DEVICE)),
+                                   Ytr[b].to(DEVICE))
+            loss.backward(); opt.step()
+    secs = time.time() - t0
+    mem = torch.cuda.max_memory_allocated() / 1e6 if DEVICE == "cuda" else float("nan")
+    res = {
+        "name": name,
+        "params": sum(p.numel() for p in model.parameters()),
+        "acc": accuracy(model, Pva, Mva, Yva),
+        "acc_shuffled": accuracy(model, Pva, Mva, Yva, shuffled=True),
+        "seconds": secs, "peak_MB": mem,
+    }
+    print(f"{name:<12} params {res['params']:>8,}   acc {res['acc']:.3f}   "
+          f"acc(shuffled) {res['acc_shuffled']:.3f}   {secs:.0f} s")
+    return res, model
+
+
+results = []
+r, _ = train_points("OrderedMLP", OrderedMLP()); results.append(r)
+
+#%% md
+There it is. The naive model scores well on the ordering it was trained with —
+well enough that you would ship it — and **collapses to exactly chance the moment
+the points are relabelled**. Same events, same hits, same physics; only the
+listing order changed.
+
+This is the same failure as the MLP in Notebook 0, in a different costume. There
+the model latched onto absolute position; here it latches onto list index. In
+both cases it learned a property of our *bookkeeping* rather than a property of
+the event, and in both cases the standard validation set failed to notice —
+because the validation set uses the same bookkeeping.
+
+> **The habit worth stealing from this notebook:** for every symmetry you believe
+> your problem has, build an evaluation that applies the transformation and
+> checks the answer does not move. Translate the event. Shuffle the hits. Rotate
+> the detector. It costs three lines and it is the only way to find out what your
+> model is really using.
+
+## 3. Deep Sets: making permutation invariance structural
+
+We do not want to *hope* the model ignores the ordering; we want it to be unable
+to see it. The recipe is remarkably simple, and the theorem behind it (Deep Sets,
+Zaheer et al. 2017) says it is fully general: any permutation-invariant function
+of a set can be written as
+
+$$f(\{x_1,\dots,x_M\}) = \rho\!\left(\bigoplus_{i=1}^{M} \phi(x_i)\right)$$
+
+where $\phi$ processes each point **independently**, $\bigoplus$ is any
+**symmetric** aggregation (sum, mean, max), and $\rho$ maps the pooled vector to
+the answer. Permutation invariance is immediate: the only step that combines
+points is symmetric, so reordering cannot change anything.
+
+PointNet is this architecture with $\phi$ a shared MLP and $\bigoplus$ a max.
+
+**Which aggregation?** This is the same "match the pooling to the physics"
+question as the task heads in Notebook 1:
+
+- **sum** — extensive quantities. Total charge, total energy, hit multiplicity.
+  Sum is the only aggregation that can count.
+- **max** — existence questions. "Is there a Bragg peak anywhere?"
+- **mean** — intensive quantities, and robust to how many hits you happened to
+  record. But it cannot count, and (Notebook 0) it dilutes rare signals.
+
+We use sum **and** max concatenated, which is common and cheap, and lets the
+network choose.
+
+#%% code
+class DeepSets(nn.Module):
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.phi = nn.Sequential(nn.Linear(3, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden))
+        self.rho = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, 3))
+
+    def forward(self, p, m):
+        # p: (B, N, 3) points        m: (B, N) mask, 1 = real hit, 0 = padding
+        f = self.phi(p) * m[..., None]            # (B, N, H) per-point features,
+                                                  #   padded rows multiplied to zero
+
+        # The only step that mixes points across the event -- and it is symmetric,
+        # which is precisely what makes the whole model permutation invariant.
+        pooled_sum = f.sum(1) / 10.0              # (B, H)  sum over the N axis
+        masked = f.masked_fill(m[..., None] == 0, -1e9)
+        pooled_max = masked.amax(1)               # (B, H)  padding can never be the max
+        both = torch.cat([pooled_sum, pooled_max], dim=-1)     # (B, 2H)
+        return self.rho(both)                                  # (B, 3) class logits
+
+
+r, deepsets = train_points("DeepSets", DeepSets()); results.append(r)
+
+#%% md
+**The two accuracy columns are now identical, to the last digit.** Not
+approximately equal — *identical*, because the network cannot represent an
+order-dependent function at all. This is what a structural symmetry buys you, and
+it is worth contrasting with the alternative: we could have trained the
+OrderedMLP with shuffled points as augmentation and it would have got most of the
+way there, approximately, at the cost of more data and more epochs. Structure
+gives you the guarantee for free.
+
+And note the parameter count: about ten times smaller than the OrderedMLP, and
+far more accurate.
+
+### What Deep Sets cannot do
+
+Look carefully at $\phi$: it sees **one point at a time**. The model knows the
+distribution of hits but nothing about their spatial relationships. It can learn
+"there are many high-charge hits far from the centroid", which is enough to
+separate a shower from a track most of the time. It cannot learn "these hits form
+a continuous line" or "the charge rises sharply at the end of a chain of hits" —
+because those are statements about *neighbourhoods*, and there are no
+neighbourhoods here.
+
+That is precisely the locality that the grid gave a CNN for free. To get it back
+without a grid, we must say explicitly which points are near which.
+
+## 4. Graphs: putting locality back by hand
+
+A **graph** is exactly that statement: nodes (our hits) plus edges (which hits are
+neighbours). Building the graph is a modelling decision and it is where your
+physics knowledge enters. Common choices:
+
+- **k-nearest neighbours** in space — the natural analogue of a convolution
+  kernel, and what we use here;
+- **radius graph** — all hits within $r$; better when density varies a lot;
+- **fully connected** — every hit to every hit. This is attention (Notebook 5),
+  and it costs $O(M^2)$;
+- **physics-defined** — wires on the same plane, hits in the same time window,
+  tracks from the same vertex.
+
+Then we do **message passing**: each node builds a message from each neighbour,
+aggregates the messages symmetrically, and updates itself. One round mixes
+information across one edge; $L$ rounds reach $L$ hops. That is the graph
+analogue of the receptive field from Notebook 1, and the same warning applies —
+count your hops against the physical scale of the feature you need.
+
+We use an **EdgeConv** update (Wang et al. 2019), which has an elegant form:
+
+$$h_i' = \max_{j \in \mathcal{N}(i)} \; \text{MLP}\!\left(\left[\,h_i \;\|\; h_j - h_i\,\right]\right)$$
+
+The **difference** $h_j - h_i$ is the important detail. It makes each message
+depend on the *relative* position of the neighbour, not its absolute position —
+translation invariance, built into the layer rather than hoped for. The `max` over
+neighbours keeps the whole thing permutation invariant.
+
+#%% code
+def knn_graph(p, m, k=12):
+    """Indices of the k nearest neighbours of each point, within each event.
+    Padded slots are pushed to infinite distance so they are never selected."""
+    # p[..., :2] keeps the (x, y) columns only: the metric is spatial, so charge
+    # must not enter the distance.
+    d = torch.cdist(p[..., :2], p[..., :2])          # (B, N, N) d[b,i,j] = |x_i - x_j|
+
+    # Entry [b, i, j] is "distance from i TO j", so blanking whole *columns* j
+    # removes padded points from everybody's candidate list at once. The mask is
+    # reshaped to (B, 1, N) so it broadcasts down the i axis.
+    d = d.masked_fill(m[:, None, :] == 0, 1e9)       # padded j -> effectively infinite
+    return d.topk(k, dim=-1, largest=False).indices  # (B, N, k) the k closest j per i
+
+
+class EdgeConv(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(2 * cin, cout), nn.ReLU(),
+                                 nn.Linear(cout, cout), nn.ReLU())
+
+    def forward(self, h, idx):
+        # h: (B, N, C) node features       idx: (B, N, k) neighbour indices
+        B, N, C = h.shape
+
+        # Goal: for every node i, collect the features of its k neighbours.
+        # `expand` gives each node its own view of the full node table -- it is a
+        # view, so no memory is copied -- and `gather` then picks the k wanted rows.
+        table = h.unsqueeze(1).expand(B, N, N, C)        # (B, N, N, C) node j's features
+        take = idx[..., None].expand(-1, -1, -1, C)      # (B, N, k, C) which j to take
+        nbr = torch.gather(table, 2, take)               # (B, N, k, C) neighbour features
+        centre = h[:, :, None, :].expand_as(nbr)         # (B, N, k, C) node i, repeated k times
+
+        # Each message is [my own features || how this neighbour DIFFERS from me].
+        # Using the difference is what makes the message depend on the neighbour's
+        # position *relative* to i rather than its absolute position.
+        msg = self.mlp(torch.cat([centre, nbr - centre], dim=-1))   # (B, N, k, cout)
+        return msg.amax(dim=2)                           # (B, N, cout) max over the k axis
+
+
+class PointGNN(nn.Module):
+    def __init__(self, hidden=48, k=12):
+        super().__init__()
+        self.k = k
+        self.conv1 = EdgeConv(3, hidden)
+        self.conv2 = EdgeConv(hidden, hidden)
+        self.head = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, 3))
+
+    def forward(self, p, m):
+        idx = knn_graph(p, m, self.k)          # (B, N, k) edges, fixed by geometry
+        h = self.conv1(p, idx)                 # (B, N, H) information travels one hop
+        h = self.conv2(h, idx)                 # (B, N, H) ...and now two hops
+        h = h * m[..., None]                   # re-zero padding before pooling
+        pooled = torch.cat([h.sum(1) / 10.0,
+                            h.masked_fill(m[..., None] == 0, -1e9).amax(1)],
+                           dim=-1)             # (B, 2H) same symmetric pooling as Deep Sets
+        return self.head(pooled)               # (B, 3)
+
+
+r, gnn = train_points("PointGNN", PointGNN()); results.append(r)
+
+#%% md
+A little better than Deep Sets, with **fewer parameters**. The gain comes from
+telling the model which hits are neighbours — the same information a CNN reads
+off the pixel grid for free.
+
+The shuffled column matches again — every ingredient is symmetric: `max` over
+neighbours, sum and max over points.
+
+But there is a subtle leak here that is worth a paragraph, because it is the same
+lesson as the odd/even pooling bars in Notebook 0. The *network* is exactly
+permutation invariant. The **graph construction** is not quite. Our hits live on
+an integer pixel grid, so a point frequently has several neighbours at exactly
+the same distance, and when distances tie `topk` returns whichever index comes
+first — which depends on the listing order. Relabel the points and a tie can
+resolve differently, giving a genuinely different graph.
+
+Whether you see this in the last digit depends on whether any borderline event
+happens to flip; often nothing changes and the accuracies match exactly. The
+point is not the size of the effect. It is that **when you build an invariant
+model, the leak is rarely in the layer you were thinking about — it is in the
+preprocessing.** If you need exactness, break ties on something
+order-independent, or use a radius graph, which has no k-th-neighbour
+ambiguity.
+
+Let us visualise what we actually built.
+
+#%% code
+i = 7
+p, m = Ptr[i:i + 1].to(DEVICE), Mtr[i:i + 1].to(DEVICE)
+idx = knn_graph(p, m, k=6)[0].cpu().numpy()
+pts = Ptr[i].numpy(); occupied = Mtr[i].numpy() > 0
+
+fig, axes = plt.subplots(1, 2, figsize=(9, 4.3))
+ms.plot_event(train, i, axes[0], "charge", title="dense image (what the CNN sees)")
+ax = axes[1]
+for a in range(len(pts)):
+    if not occupied[a]:
+        continue
+    for b in idx[a][:4]:
+        ax.plot([pts[a, 0], pts[b, 0]], [pts[a, 1], pts[b, 1]],
+                color="#4cc9f0", lw=0.3, alpha=0.5, zorder=1)
+ax.scatter(pts[occupied, 0], pts[occupied, 1], c=pts[occupied, 2],
+           s=7, cmap="viridis", zorder=2)
+ax.set_title("k-NN graph (what the GNN sees)", fontsize=9)
+ax.set_aspect("equal"); ax.set_facecolor("#101418")
+ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout(); plt.show()
+
+#%% md
+## 5. The same thing in PyTorch Geometric
+
+Our from-scratch implementation used the padded representation (Option A). Real
+graph libraries use Option B — one long list of nodes plus a batch index — and
+handle the scatter operations for you. It is worth seeing, because it is what you
+will actually use, and because the bookkeeping is genuinely different.
+
+#%% code
+try:
+    import torch_geometric
+except ImportError:
+    !pip install -q torch_geometric
+    import torch_geometric
+
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import EdgeConv as PyGEdgeConv, global_max_pool, knn_graph as pyg_knn
+
+print("torch_geometric", torch_geometric.__version__)
+
+#%% code
+def to_pyg(ds, n_events=1500, seed=0):
+    """Option B: no padding, no truncation, no mask -- just a batch index."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for i in range(n_events):
+        coords, feats = ms.to_points(ds["image"][i])
+        centroid = (coords * feats).sum(0) / feats.sum()
+        x = np.concatenate([(coords - centroid) / 48.0,
+                            np.log1p(feats) / 3.0], axis=1).astype(np.float32)
+        out.append(Data(x=torch.tensor(x),
+                        pos=torch.tensor((coords - centroid) / 48.0),
+                        y=torch.tensor([int(ds["label"][i])])))
+    return out
+
+
+pyg_train = to_pyg(train, 1500, seed=0)
+pyg_val   = to_pyg(val, 500, seed=1)
+
+batch = next(iter(DataLoader(pyg_train, batch_size=4, shuffle=False)))
+print("one batch of 4 events, concatenated:")
+print(f"  x           {tuple(batch.x.shape)}   <- all hits from all 4 events")
+print(f"  batch index {tuple(batch.batch.shape)}  values {batch.batch.unique().tolist()}")
+print(f"  hits per event in this batch: {torch.bincount(batch.batch).tolist()}")
+print("\nno padding, no mask, no truncation -- the batch index does that work")
+
+#%% code
+class PyGNet(nn.Module):
+    def __init__(self, hidden=48, k=12):
+        super().__init__()
+        self.k = k
+        self.conv1 = PyGEdgeConv(nn.Sequential(nn.Linear(6, hidden), nn.ReLU(),
+                                               nn.Linear(hidden, hidden), nn.ReLU()))
+        self.conv2 = PyGEdgeConv(nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(),
+                                               nn.Linear(hidden, hidden), nn.ReLU()))
+        self.head = nn.Linear(hidden, 3)
+
+    def forward(self, data):
+        edge_index = pyg_knn(data.pos, k=self.k, batch=data.batch)
+        h = self.conv2(self.conv1(data.x, edge_index), edge_index)
+        return self.head(global_max_pool(h, data.batch))
+
+
+torch.manual_seed(0)
+model = PyGNet().to(DEVICE)
+opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+loader = DataLoader(pyg_train, batch_size=32, shuffle=True)
+val_loader = DataLoader(pyg_val, batch_size=64)
+
+t0 = time.time()
+for ep in range(8):
+    model.train()
+    for b in loader:
+        b = b.to(DEVICE)
+        opt.zero_grad()
+        F.cross_entropy(model(b), b.y).backward()
+        opt.step()
+model.eval()
+correct = 0
+with torch.no_grad():
+    for b in val_loader:
+        b = b.to(DEVICE)
+        correct += (model(b).argmax(1) == b.y).sum().item()
+print(f"PyG EdgeConv: val acc {correct / len(pyg_val):.3f}   "
+      f"({time.time() - t0:.0f} s, on a smaller subset)")
+
+#%% md
+Same architecture, same idea, an order of magnitude less bookkeeping. Note in
+particular that `pyg_knn` takes the `batch` vector so that neighbours are never
+selected across event boundaries — the bug you would eventually write yourself,
+and the reason to use the library.
+
+## 6. The comparison promised in Notebook 0
+
+Finally, all three representations of the same events, on the same task. We add a
+small CNN on the dense images as the reference.
+
+#%% code
+def make_cnn(ch=24):
+    def blk(cin, cout):
+        return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout),
+                             nn.ReLU(), nn.Conv2d(cout, cout, 3, padding=1),
+                             nn.BatchNorm2d(cout), nn.ReLU(), nn.MaxPool2d(2))
+    return nn.Sequential(blk(1, ch), blk(ch, ch), blk(ch, ch),
+                         nn.AdaptiveMaxPool2d(1), nn.Flatten(), nn.Linear(ch, 3))
+
+
+SCALE = float(np.percentile(train["image"][train["image"] > 0], 99))
+Xtr = torch.tensor(train["image"])[:, None] / SCALE
+Xva = torch.tensor(val["image"])[:, None] / SCALE
+
+torch.manual_seed(0)
+cnn = make_cnn().to(DEVICE)
+opt = torch.optim.Adam(cnn.parameters(), lr=2e-3)
+if DEVICE == "cuda":
+    torch.cuda.reset_peak_memory_stats()
+t0 = time.time()
+for ep in range(8):
+    cnn.train()
+    perm = torch.randperm(len(Xtr))
+    for i in range(0, len(perm), 64):
+        b = perm[i:i + 64]
+        opt.zero_grad()
+        F.cross_entropy(cnn(Xtr[b].to(DEVICE)), Ytr[b].to(DEVICE)).backward()
+        opt.step()
+cnn_secs = time.time() - t0
+cnn_mem = torch.cuda.max_memory_allocated() / 1e6 if DEVICE == "cuda" else float("nan")
+cnn.eval()
+correct = 0
+with torch.no_grad():
+    for i in range(0, len(Xva), 256):
+        correct += (cnn(Xva[i:i + 256].to(DEVICE)).argmax(1).cpu()
+                    == Yva[i:i + 256]).sum().item()
+cnn_res = {"name": "CNN (dense)", "params": sum(p.numel() for p in cnn.parameters()),
+           "acc": correct / len(Xva), "acc_shuffled": float("nan"),
+           "seconds": cnn_secs, "peak_MB": cnn_mem}
+print(f"CNN (dense)  params {cnn_res['params']:>8,}   acc {cnn_res['acc']:.3f}   "
+      f"{cnn_secs:.0f} s")
+
+#%% code
+rows = [cnn_res] + results
+print(f"{'model':<14}{'repr.':<12}{'params':>9}{'val acc':>10}"
+      f"{'shuffled':>10}{'train s':>9}{'peak MB':>10}")
+print("-" * 74)
+reprs = {"CNN (dense)": "image", "OrderedMLP": "point list",
+         "DeepSets": "point set", "PointGNN": "graph"}
+for r in rows:
+    sh = "n/a" if np.isnan(r["acc_shuffled"]) else f"{r['acc_shuffled']:.3f}"
+    print(f"{r['name']:<14}{reprs[r['name']]:<12}{r['params']:>9,}"
+          f"{r['acc']:>10.3f}{sh:>10}{r['seconds']:>9.0f}{r['peak_MB']:>10.0f}")
+
+#%% md
+### How to read this table
+
+**First, the `n/a`.** The "shuffled" column asks what happens when the hits are
+listed in a different order — a question that only means anything if the model is
+given a *list of hits*. The CNN is given a dense image, where every hit sits at
+its own pixel and there is no ordering to permute: shuffling the point list and
+rasterising it back produces exactly the same image. The CNN is permutation
+invariant trivially, by virtue of a representation that never exposed an order in
+the first place. That is worth noticing rather than skipping over — **choosing a
+representation without a spurious degree of freedom is better than choosing a
+model that learns to ignore one.**
+
+**The CNN is excellent and it is not obsolete.** On grid-structured data with a
+fixed geometry, a convolution is a superbly engineered piece of machinery:
+decades of kernel optimisation, and an inductive bias that fits the data. Do not
+abandon it because point clouds are fashionable.
+
+**The point-based models are far smaller in parameters** and land just short of
+the CNN on accuracy, having never been told there is a grid. Their real advantage
+is scaling: their cost tracks the number of *hits*, not the number of *pixels*.
+Double the detector volume at fixed occupancy and the CNN's cost doubles while
+the point cloud's stays flat. That is the argument that matters at DUNE scale.
+
+**But look at the peak-memory and wall-clock columns before you get excited.**
+Our GNN uses *more* memory than the CNN and is not faster. That is not a
+statement about graph networks; it is a statement about our implementation, and
+the reasons are worth naming:
+
+- the $k$-NN search builds a dense $(B, N, N)$ distance matrix and is $O(M^2)$ in
+  the number of points — at 384 points that is affordable, at 100 000 it is not;
+- we rebuild the graph on **every forward pass**;
+- padding to `N_MAX` means we carry the wasted slots through every layer.
+
+Real systems cache the graph, use spatial hashing or k-d trees, use the
+concatenated representation to avoid padding, or skip the graph entirely and use
+sparse convolutions. **The asymptotic argument for point clouds is sound; the
+constant factors are entirely up to you**, and a naive implementation will give
+away everything the representation gained.
+
+**Choose your representation from your data, not from fashion:**
+
+| your data | reach for |
+|---|---|
+| dense, regular grid, moderate size | **CNN** |
+| grid-structured but very sparse (LArTPC, calorimeters) | **sparse / submanifold convolution** |
+| no grid: particle lists, jet constituents, irregular geometry | **GNN / transformer** |
+| set with no meaningful geometry at all | **Deep Sets** |
+
+## 7. The third way: sparse convolutions
+
+We skipped the option that is, for our data, probably the best one.
+
+A **sparse convolution** does exactly what a dense convolution does — same
+kernel, same weight sharing, same translation equivariance — but stores only
+occupied sites in a hash map and computes only where there is something to
+compute. Everything you learned in Notebook 1 about receptive fields still
+applies unchanged.
+
+There is one wrinkle worth knowing, because it is the difference between the
+technique working and not working. A standard sparse convolution **dilates** the
+active region: apply a $3\times3$ kernel to an isolated hit and you now have 9
+active sites. Stack ten such layers and your carefully sparse event has become
+dense — you have gained nothing. The fix is the **submanifold sparse
+convolution**, which computes outputs *only at sites that were already active*.
+Sparsity is then preserved exactly through arbitrary depth, at the cost of not
+propagating information into empty space (so you interleave a few ordinary sparse
+convolutions or poolings when you need the receptive field to grow).
+
+This is the standard tool in LArTPC reconstruction, and it is how experiments run
+U-Nets over full detector volumes that would never fit densely.
+
+**Why it is not in this notebook:** the two main libraries
+([MinkowskiEngine](https://github.com/NVIDIA/MinkowskiEngine) and
+[spconv](https://github.com/traveller59/spconv)) need compiled CUDA extensions
+matched to your exact PyTorch and CUDA versions. On Colab that is a fragile
+15-minute build that breaks whenever Colab updates. If you work with sparse
+detector data, it is absolutely worth setting up properly in your own
+environment; it is not worth 15 minutes of a summer school. Try `spconv` first —
+it ships prebuilt wheels for common CUDA versions.
+
+#%% code
+occ = float((train["image"] > 0).mean())
+print("what submanifold sparsity would save on our data")
+print(f"  occupancy                     {100 * occ:.1f} %")
+print(f"  dense conv work               1.00x")
+print(f"  submanifold sparse conv work  {occ:.3f}x  "
+      f"(~{1 / occ:.0f}x less arithmetic)")
+print()
+print("  ...and unlike the point-cloud models, you keep the grid, the")
+print("  convolution, and every intuition from Notebook 1.")
+
+#%% md
+## 8. Takeaways
+
+1. **Variable-size data is the real friction.** Pad + mask (simple, wasteful,
+   easy to get subtly wrong) or concatenate + batch index (no waste, needs
+   scatter ops and a library). Know which one your code is doing.
+2. **Padding is not free and truncation is not neutral.** We discarded hits from
+   the busiest events, which biases against high-multiplicity physics.
+3. **A model that reads a point list is order-dependent** unless you make it
+   otherwise, and a standard validation set will not tell you — it shares your
+   bookkeeping.
+4. **Deep Sets gives permutation invariance structurally**: process points
+   independently, aggregate symmetrically. Its shuffled and unshuffled accuracies
+   are identical by construction, not approximately equal.
+   The GNN's are not *quite* identical — the leak is in `topk` tie-breaking
+   during graph construction, not in the network. Symmetry leaks usually hide in
+   preprocessing.
+5. **Match the aggregation to the physics.** Sum counts, max detects, mean
+   normalises.
+6. **Graphs put locality back by hand.** The graph you build *is* your inductive
+   bias; edges are a modelling choice, and message-passing rounds are a
+   receptive field.
+7. **Cost scales with hits, not pixels** — which is the whole argument once the
+   detector gets large.
+8. **For sparse data on a grid, submanifold sparse convolutions are usually the
+   right answer** and keep every CNN intuition intact.
+
+## 9. Exercises
+
+1. **Break the invariance on purpose.** Replace `amax` with `h[:, :, 0, :]`
+   (take the first neighbour) in `EdgeConv`. Predict what the shuffled column
+   does, then check.
+2. **Aggregation ablation.** Train `DeepSets` with sum only, max only, and mean
+   only. Which task suffers most from mean pooling, and does your explanation
+   match Notebook 1's argument about extensive quantities?
+3. **How many hops do you need?** Sweep the number of `EdgeConv` layers from 1 to
+   4 and $k$ from 4 to 32. Relate what you find to the receptive-field discussion
+   in Notebook 1 — how far can information travel in $L$ rounds?
+4. **Truncation bias.** Set `N_MAX = 96` and retrain. Which event class suffers
+   most? (Look at the hit-count histogram before you guess.) Then check the
+   per-class accuracy, not just the overall number — that is where a selection
+   bias shows itself.
+5. **Absolute position.** Remove the centroid subtraction in `to_point_cloud`, so
+   coordinates are absolute. Accuracy will probably improve slightly. Explain why
+   that is bad news rather than good, and design the test that exposes it.
+6. **Per-point predictions.** All our point models output one label per *event*.
+   Modify `PointGNN` to predict a label per *hit* (semantic segmentation, as in
+   Notebook 1) by dropping the global pooling and putting the head on each node
+   instead. Compare with the U-Net.

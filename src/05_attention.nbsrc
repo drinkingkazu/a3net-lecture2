@@ -1,0 +1,496 @@
+#%% md
+# Lecture 2 · Notebook 5 — Attention: a graph that builds itself
+
+**ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
+
+*Optional add-on. Nothing later depends on it.*
+
+---
+
+### Where we are
+
+In Notebook 3 we made a decision that deserves more scrutiny than it got. To give
+our point-cloud model a sense of locality, we built a **k-nearest-neighbour
+graph**: each hit was connected to its 12 closest neighbours in space.
+
+That graph is a *prior*. We asserted that spatial proximity is the right notion
+of relatedness, and the model had no say in the matter. For a LArTPC that is a
+defensible assertion — ionisation is deposited locally. But it is not always
+right, and it is never the whole story:
+
+- two hits at opposite ends of the same track are strongly related and very far
+  apart;
+- a hit in a shower and a hit in an unrelated cosmic ray can be adjacent and
+  entirely unrelated;
+- the right notion of "related" may depend on *what the hits look like*, not just
+  where they are.
+
+**Attention removes the assertion.** Instead of fixing the edges in advance, we
+connect every point to every other point and let the network *learn*, from the
+content of each pair, how much one should influence the other.
+
+> **The one-sentence summary:** attention is message passing on a fully connected
+> graph, where the edge weights are computed from the data instead of from the
+> geometry.
+>
+> If you understood Notebook 3, you already understand transformers. What follows
+> is the arithmetic.
+
+**Runtime:** roughly 8–11 minutes on a Colab T4.
+
+#%% md
+## 0. Setup
+
+#%% setup
+
+#%% code
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+torch.manual_seed(0)
+np.random.seed(0)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("torch", torch.__version__, "| device:", DEVICE)
+
+#%% code
+train = ms.generate_dataset(4000, seed=0, progress=True)
+val   = ms.generate_dataset(1000, seed=1)
+Ytr, Yva = torch.tensor(train["label"]), torch.tensor(val["label"])
+
+N_MAX = 256
+
+
+def to_point_cloud(ds, n_max=N_MAX, seed=0):
+    rng = np.random.default_rng(seed)
+    n = len(ds["image"])
+    pts = np.zeros((n, n_max, 3), np.float32)
+    mask = np.zeros((n, n_max), np.float32)
+    for i in range(n):
+        coords, feats = ms.to_points(ds["image"][i])
+        if len(coords) > n_max:
+            keep = rng.choice(len(coords), n_max, replace=False)
+            coords, feats = coords[keep], feats[keep]
+        m = len(coords)
+        centroid = (coords * feats).sum(0) / feats.sum()
+        pts[i, :m, :2] = (coords - centroid) / 48.0
+        pts[i, :m, 2] = np.log1p(feats[:, 0]) / 3.0
+        mask[i, :m] = 1.0
+    return torch.tensor(pts), torch.tensor(mask)
+
+
+Ptr, Mtr = to_point_cloud(train, seed=0)
+Pva, Mva = to_point_cloud(val, seed=1)
+print(f"points {tuple(Ptr.shape)}   occupied {Mtr.mean():.2f}")
+
+#%% md
+## 1. The mechanism
+
+Each point $i$ produces three vectors from its own features, via three learned
+linear maps:
+
+- a **query** $q_i$ — "what am I looking for?"
+- a **key** $k_i$ — "what do I offer?"
+- a **value** $v_i$ — "what do I pass on if selected?"
+
+The influence of point $j$ on point $i$ is the compatibility of $i$'s query with
+$j$'s key, normalised across all $j$:
+
+$$\alpha_{ij} = \frac{\exp\!\left(q_i \cdot k_j / \sqrt{d}\right)}
+                     {\sum_{j'} \exp\!\left(q_i \cdot k_{j'} / \sqrt{d}\right)},
+\qquad
+h_i' = \sum_j \alpha_{ij}\, v_j$$
+
+Three observations, and they are the whole story.
+
+**This is message passing.** Compare with EdgeConv from Notebook 3:
+$h_i' = \max_{j \in \mathcal{N}(i)} \text{MLP}([h_i \| h_j - h_i])$. Same shape —
+gather from neighbours, combine, aggregate. Two differences: the neighbourhood
+$\mathcal{N}(i)$ is now *everything*, and the aggregation is a learned weighted
+average instead of a max over a fixed set.
+
+**The $\sqrt{d}$ matters.** For $d$-dimensional vectors with unit-variance
+entries, $q\cdot k$ has variance $d$. Without the $1/\sqrt{d}$, the softmax
+saturates as $d$ grows: one weight goes to 1, the rest to 0, and the gradient
+vanishes. This is the same "keep the scale under control" reasoning as
+normalisation layers in Notebook 2, applied to a dot product.
+
+**Attention is permutation equivariant, and this cuts both ways.** Reorder the
+points and the outputs reorder identically — nothing depends on index. For us
+that is exactly right: our hits are a set. For a *sequence*, where order carries
+meaning, it is a defect, and it is why transformers on text must add
+**positional encodings**. We do not need them, because our coordinates are
+already input features. That contrast is worth remembering: a transformer knows
+nothing about position unless you tell it.
+
+#%% code
+class SelfAttention(nn.Module):
+    """Single-head self-attention over a padded, masked point cloud."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.scale = dim ** -0.5
+
+    def forward(self, h, mask, return_weights=False):
+        # h: (B, N, D) point features     mask: (B, N), 1 = real hit, 0 = padding
+        q, k, v = self.q(h), self.k(h), self.v(h)      # three (B, N, D) views of h
+
+        # q @ k^T contracts the feature axis, leaving one score per ORDERED PAIR.
+        # transpose(1, 2) turns k from (B, N, D) into (B, D, N) so the matmul lines
+        # the D axes up. Entry [b, i, j] = how much point i wants point j.
+        logits = (q @ k.transpose(1, 2)) * self.scale            # (B, N, N)
+
+        # Blank whole columns j that are padding, so no real point can attend TO a
+        # padded slot. -1e9 becomes ~0 after the softmax. Mask is (B, 1, N) so it
+        # broadcasts down the i axis -- same trick as knn_graph in Notebook 3.
+        logits = logits.masked_fill(mask[:, None, :] == 0, -1e9)
+        alpha = logits.softmax(dim=-1)                 # (B, N, N) each ROW sums to 1
+        out = alpha @ v                                # (B, N, D) weighted average of v
+        return (out, alpha) if return_weights else out
+
+
+class AttentionBlock(nn.Module):
+    """Pre-norm transformer block: attention, then a per-point MLP, both residual."""
+
+    def __init__(self, dim, expansion=2):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.attn = SelfAttention(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, expansion * dim), nn.GELU(),
+                                 nn.Linear(expansion * dim, dim))
+
+    def forward(self, h, mask):
+        # "Pre-norm": normalise the INPUT of each sub-layer, then add the result to
+        # the untouched h. The `h +` is the residual path from Notebook 2 -- without
+        # it a stack of these does not train.
+        h = h + self.attn(self.n1(h), mask)     # (B, N, D) mix information across points
+        h = h + self.mlp(self.n2(h))            # (B, N, D) then think per point
+        return h * mask[..., None]              # keep padded rows at exactly zero
+
+
+class PointTransformer(nn.Module):
+    def __init__(self, dim=48, depth=2):
+        super().__init__()
+        self.embed = nn.Linear(3, dim)
+        self.blocks = nn.ModuleList([AttentionBlock(dim) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, 3))
+
+    def forward(self, p, m, return_weights=False):
+        h = self.embed(p) * m[..., None]       # (B, N, D) lift (x, y, q) to D channels
+        for blk in self.blocks:
+            h = blk(h, m)                      # (B, N, D) unchanged shape, richer features
+        h = self.norm(h) * m[..., None]        # (B, N, D)
+        # Same symmetric pooling as Deep Sets: this is what turns a per-point
+        # representation into one prediction per event.
+        pooled = torch.cat([h.sum(1) / 10.0,
+                            h.masked_fill(m[..., None] == 0, -1e9).amax(1)],
+                           dim=-1)             # (B, 2D)
+        return self.head(pooled)               # (B, 3)
+
+
+print(PointTransformer())
+
+#%% md
+Three details in that code are load-bearing, and each is a bug you would
+otherwise write.
+
+**The mask is applied to the attention *logits*, not to the output.** If you
+forget, every real point attends to your zero padding, softmax gives it weight,
+and the model quietly learns from the padding. It will still train. It will just
+be wrong, and it will behave differently when you change the batch composition.
+
+**LayerNorm, not BatchNorm.** LayerNorm normalises over the feature dimension
+within each point, independently of every other point and of the batch. That is
+essential here: our events have different numbers of points, so batch statistics
+would be computed over a varying, padding-contaminated population. This is
+exactly the historical reason transformers adopted LayerNorm — see the timeline
+in Notebook 2.
+
+**Residual connections around both sub-layers** — the `h + ...` pattern. Same
+mechanism as Notebook 2 §3: without them, a stack of attention blocks does not
+train. Transformers are just as dependent on residual connections as ResNets;
+the name simply moved on.
+
+#%% code
+def train_model(name, model, epochs=10, lr=2e-3, bs=64):
+    torch.manual_seed(0)
+    model = model.to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    steps = epochs * int(np.ceil(len(Ptr) / bs))
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps,
+                                                pct_start=0.2)
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    for ep in range(epochs):
+        model.train()
+        perm = torch.randperm(len(Ptr))
+        for i in range(0, len(perm), bs):
+            b = perm[i:i + bs]
+            opt.zero_grad()
+            F.cross_entropy(model(Ptr[b].to(DEVICE), Mtr[b].to(DEVICE)),
+                            Ytr[b].to(DEVICE)).backward()
+            opt.step(); sched.step()
+    secs = time.time() - t0
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for i in range(0, len(Pva), 128):
+            correct += (model(Pva[i:i + 128].to(DEVICE), Mva[i:i + 128].to(DEVICE))
+                        .argmax(1).cpu() == Yva[i:i + 128]).sum().item()
+    mem = torch.cuda.max_memory_allocated() / 1e6 if DEVICE == "cuda" else float("nan")
+    print(f"{name:<20} params {sum(p.numel() for p in model.parameters()):>8,}   "
+          f"acc {correct / len(Pva):.3f}   {secs:>4.0f} s   peak {mem:>5.0f} MB")
+    return model
+
+
+transformer = train_model("PointTransformer", PointTransformer(dim=48, depth=2))
+
+#%% md
+## 2. What did it learn to attend to?
+
+The attention weights $\alpha_{ij}$ are a learned adjacency matrix, and unlike
+almost anything else inside a neural network they are directly interpretable: row
+$i$ tells you, as a probability distribution, where point $i$ looked.
+
+Let us pick a hit and see.
+
+#%% code
+i_event = 7
+p = Pva[i_event:i_event + 1].to(DEVICE)
+m = Mva[i_event:i_event + 1].to(DEVICE)
+
+transformer.eval()
+with torch.no_grad():
+    # Reproduce the first block's input by hand, then ask its attention layer for
+    # the weights it would use. (There is one attention matrix per block; we look
+    # at the first.)
+    h = transformer.embed(p) * m[..., None]                       # (1, N, D)
+    blk = transformer.blocks[0]
+    _, alpha = blk.attn(blk.n1(h), m, return_weights=True)        # (1, N, N)
+alpha = alpha[0].cpu().numpy()      # (N, N); row i = where point i looked
+pts = Pva[i_event].numpy()
+occ = Mva[i_event].numpy() > 0
+
+# query points: the highest-charge hit, and a random low-charge one
+order = np.argsort(-pts[:, 2] * occ)
+queries = [int(order[0]), int(order[len(np.nonzero(occ)[0]) // 2])]
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.9))
+ms.plot_event(val, i_event, axes[0], "charge", title="the event")
+for ax, qi in zip(axes[1:], queries):
+    w = alpha[qi].copy(); w[~occ] = 0
+    ax.scatter(pts[occ, 0], pts[occ, 1], c=w[occ], s=14,
+               cmap="magma", vmin=0, vmax=np.percentile(w[occ], 99.5))
+    ax.scatter([pts[qi, 0]], [pts[qi, 1]], s=90, facecolors="none",
+               edgecolors="#4cc9f0", linewidths=1.8)
+    ax.set_title(f"attention from the circled hit\n(top weight {w.max():.3f}, "
+                 f"uniform would be {1 / occ.sum():.4f})", fontsize=8)
+    ax.set_aspect("equal"); ax.set_facecolor("#101418")
+    ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout(); plt.show()
+
+#%% md
+Compare the peak weight with the uniform value $1/M$ printed in each title. If the
+peak is far above uniform, the head has learned to be selective; if it sits close
+to uniform, that head is doing something closer to global averaging — which is
+also a legitimate thing for it to learn, and is roughly what the sum-pooling in
+Deep Sets does by hand.
+
+Two warnings about reading these pictures, because attention maps are the most
+over-interpreted object in modern machine learning:
+
+1. **Attention weights are not explanations.** A large $\alpha_{ij}$ means point
+   $j$'s *value vector* contributed strongly to point $i$'s update at this layer.
+   It does not mean $j$ caused the final prediction; the value vector may carry
+   little information, and later layers may discard it entirely.
+2. **They are one head of one layer.** With multiple heads and several layers,
+   information routes through many such matrices. A single map is a slice through
+   a much larger computation.
+
+Useful for developing intuition and for spotting gross pathologies (a head that
+attends only to padding, say). Not evidence.
+
+## 3. The comparison
+
+Against the models from Notebook 3, on the same events and the same task.
+
+#%% code
+# The three baselines below are reproduced verbatim from Notebook 3; the
+# shape-by-shape walk-through of DeepSets and EdgeConv lives there. Skim them.
+class DeepSets(nn.Module):
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.phi = nn.Sequential(nn.Linear(3, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden))
+        self.rho = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, 3))
+
+    def forward(self, p, m):
+        f = self.phi(p) * m[..., None]
+        return self.rho(torch.cat([f.sum(1) / 10.0,
+                                   f.masked_fill(m[..., None] == 0, -1e9).amax(1)], -1))
+
+
+def knn_graph(p, m, k=12):
+    d = torch.cdist(p[..., :2], p[..., :2]).masked_fill(m[:, None, :] == 0, 1e9)
+    return d.topk(k, dim=-1, largest=False).indices
+
+
+class EdgeConv(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(2 * cin, cout), nn.ReLU(),
+                                 nn.Linear(cout, cout), nn.ReLU())
+
+    def forward(self, h, idx):
+        B, N, C = h.shape
+        nbr = torch.gather(h.unsqueeze(1).expand(B, N, N, C), 2,
+                           idx[..., None].expand(-1, -1, -1, C))
+        centre = h[:, :, None, :].expand_as(nbr)
+        return self.mlp(torch.cat([centre, nbr - centre], -1)).amax(2)
+
+
+class PointGNN(nn.Module):
+    def __init__(self, hidden=48, k=12, depth=2):
+        super().__init__()
+        self.k = k
+        self.convs = nn.ModuleList([EdgeConv(3 if i == 0 else hidden, hidden)
+                                    for i in range(depth)])
+        self.head = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, 3))
+
+    def forward(self, p, m):
+        idx = knn_graph(p, m, self.k)
+        h = p
+        for conv in self.convs:
+            h = conv(h, idx)
+        h = h * m[..., None]
+        return self.head(torch.cat([h.sum(1) / 10.0,
+                                    h.masked_fill(m[..., None] == 0, -1e9).amax(1)], -1))
+
+
+_ = train_model("DeepSets (no edges)", DeepSets())
+_ = train_model("PointGNN k=12", PointGNN(48, k=12, depth=2))
+_ = train_model("PointGNN k=32", PointGNN(48, k=32, depth=2))
+# a fair fight: a GNN with the SAME parameter count as the transformer
+_ = train_model("PointGNN param-matched", PointGNN(64, k=24, depth=3))
+_ = train_model("Transformer", PointTransformer(dim=48, depth=2))
+
+#%% md
+### What to conclude — and what not to
+
+The transformer wins here, by a couple of points, and the param-matched GNN does
+not close the gap. That is a real result and it deserves an explanation rather
+than a shrug.
+
+The obvious explanation — "the transformer has more parameters" — is the one we
+controlled for, and it is wrong: a GNN with the same parameter count does no
+better than the small one. Widening the neighbourhood from $k=12$ to $k=32$ helps
+a little, and that is the clue.
+
+**The k-NN graph's problem here is not its prior, it is its range.** Two
+message-passing rounds over 12 neighbours reach only a small patch of the event.
+But "is this a shower?" is a question about the *global* distribution of hits —
+how the charge spreads with distance from the vertex — and a single attention
+layer relates every hit to every other hit at once. This is the receptive-field
+argument from Notebook 1, transplanted: our GNN could not see far enough, and
+attention has effectively infinite range in one layer.
+
+So the honest summary is not "attention is better than graphs". It is that we
+chose a neighbourhood too small for the physics, and attention was robust to our
+having chosen badly — because it does not require us to choose at all. A larger
+$k$, more rounds, or a multi-scale graph would narrow the gap. That is a fair
+amount of tuning we did not have to do for the transformer, and *that* is
+attention's practical selling point: **it is forgiving of a prior you have not
+worked out yet.**
+
+Note the cost columns too, and one surprise: the transformer uses far *less*
+peak memory than our GNN. That is not a fact about attention — it is a fact about
+our deliberately-explicit `EdgeConv`, which materialises a large gather tensor.
+A production graph library would not.
+
+Attention earns its keep when:
+
+- **the right notion of relatedness is not geometric** — particles from a common
+  vertex, hits sharing a timing coincidence, tracks in different detector
+  subsystems;
+- **long-range relationships matter** and would need many message-passing hops;
+- **you have a lot of data**, enough to learn the structure rather than assume it;
+- **the input is genuinely a set with no natural metric** — jet constituents,
+  reconstructed particle lists, tracks in an event.
+
+That last case is where transformers have genuinely taken over in particle
+physics: models operating on lists of reconstructed objects, where there is no
+grid and no obvious neighbourhood, are now routinely transformers.
+
+### The cost
+
+#%% code
+for n in (128, 256, 1024, 4096, 16384):
+    attn = n * n
+    knn = n * 12
+    print(f"M = {n:>6} points:  attention {attn:>12,} pairs   "
+          f"k-NN {knn:>10,} edges   ratio {attn / knn:>8,.0f}x")
+
+#%% md
+Attention is $O(M^2)$ in both time and memory. At 256 hits that is nothing. At
+the ~$10^5$ hits of a full LArTPC event it is fatal — the attention matrix alone
+would be $10^{10}$ entries.
+
+This quadratic wall is why a large fraction of transformer research is about
+avoiding it: local/windowed attention, linear attention, FlashAttention (which
+does not reduce the FLOPs but avoids ever materialising the matrix), and
+hierarchical schemes that attend over clusters rather than raw hits.
+
+For physics the pragmatic pattern is a **hybrid**: use a cheap local method to
+reduce many raw hits to a few hundred meaningful objects — sparse convolutions,
+clustering, or standard reconstruction — and then apply a transformer to *those*.
+You get learned, content-dependent relationships where they matter, at a size
+where quadratic cost is affordable.
+
+## 4. Takeaways
+
+1. **Attention is message passing on a complete graph with learned edge
+   weights.** Everything from Notebook 3 carries over.
+2. **You are trading a prior for flexibility.** A k-NN graph asserts both what
+   relatedness means *and how far it reaches*; attention assumes neither, and
+   pays in compute. Assert when you are confident; learn when you are not — and
+   note that here our assertion about *range* was the one that was wrong.
+3. **Mask the logits, not the output**, or your model will read its own padding.
+4. **LayerNorm and residual connections are not decoration.** They are the
+   reason a deep stack of attention blocks trains at all — the same lesson as
+   Notebook 2, in a different architecture.
+5. **Attention maps are intuition, not explanation.**
+6. **$O(M^2)$ is a real wall.** Reduce to objects first, then attend.
+7. **Compare at matched capacity before you conclude anything.** "The
+   transformer won" and "the transformer had more parameters" are different
+   claims; one control run separates them. Here the gap survived the control, and
+   the receptive-field argument from Notebook 1 explains why.
+
+## 5. Exercises
+
+1. **Break the mask.** Remove the `masked_fill` from `SelfAttention` and retrain.
+   Accuracy may barely move — then evaluate with `N_MAX = 384` padding instead of
+   256 and watch it fall apart. Why is that the more dangerous kind of bug?
+2. **Multi-head attention.** Split the dimension into 4 heads, run attention
+   independently in each, concatenate. Do different heads specialise? (Plot their
+   attention maps for the same query point.)
+3. **Relative position.** Add a bias to the attention logits that depends on the
+   distance between points, $\alpha_{ij} \propto \exp(q_i\cdot k_j/\sqrt{d} -
+   \lambda \lVert x_i - x_j \rVert)$, with $\lambda$ learned. You have just
+   interpolated between attention and a k-NN graph. Does it beat both?
+4. **Depth versus heads.** For a fixed parameter budget, is it better to have
+   more blocks or wider ones? Compare against the receptive-field reasoning in
+   Notebook 1 — how many blocks does a transformer need to relate two arbitrary
+   hits? (Hint: the answer is surprisingly small, and it is the main argument for
+   attention.)

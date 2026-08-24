@@ -1,0 +1,459 @@
+#%% md
+# Lecture 2 · Notebook 4 — Transfer learning and the simulation-to-data gap
+
+**ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
+
+---
+
+### Where we are
+
+Every model in this lecture has been trained from random initialisation on
+thousands of perfectly labelled events. That is a luxury of simulation. Your
+actual situation will look like this:
+
+- **Simulation is abundant and perfectly labelled.** You can generate as much as
+  your CPU budget allows, and you know the truth for every pixel.
+- **Real data is abundant and unlabelled.** Nobody tells you which hits belong to
+  the shower.
+- **Labelled real data is scarce and expensive.** Hand-scanning, control samples,
+  test-beam runs — hundreds of events, not hundreds of thousands.
+- **And simulation is not data.** Your detector has noise your simulation does
+  not model, calibration that drifted, and physics your generator approximates.
+
+The last point is the one that ruins careers, so we will measure it first. A
+model trained on simulation and deployed on data can fail badly, and it will not
+warn you: its validation accuracy — computed on simulation — stays beautiful.
+
+This notebook works through the remedies **in order of cost**, which is the order
+you should try them in:
+
+1. Measure the gap. (Free, and skipping it is negligence.)
+2. **Recalibrate the normalisation statistics** on unlabelled real data. Free, no
+   labels, and it recovers a startling amount.
+3. **Fine-tune on a few hundred labels.** Show that a pretrained encoder is worth
+   roughly an order of magnitude in labelled data.
+4. Know what none of this fixes.
+
+**Runtime:** roughly 10–14 minutes on a Colab T4.
+
+#%% md
+## 0. Setup
+
+#%% setup
+
+#%% code
+import copy
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+torch.manual_seed(0)
+np.random.seed(0)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("torch", torch.__version__, "| device:", DEVICE)
+
+#%% md
+## 1. Two domains
+
+Our simulator takes detector parameters, so we can manufacture an honest domain
+shift rather than hand-waving about one. The "real detector" differs from our
+simulation in three physically plausible ways:
+
+| | simulation | "real data" |
+|---|---|---|
+| **gain** | nominal | 0.25× — the electronics calibration is off by a large factor |
+| **noise** | 30 hits/event | 900 hits/event — real electronics are far noisier than the toy model |
+| **scattering** | nominal | 7× — more multiple scattering, so tracks wander and showers are more diffuse |
+
+Every one of those has a real counterpart. Mis-modelled gain, under-simulated
+noise, and imperfect transport physics are three of the most common ways a
+simulation fails to describe a detector. The *physics* is unchanged: a track is
+still a track, a shower is still a shower, and the class definitions are
+identical. Only the appearance differs.
+
+#%% code
+DATA_DOMAIN = dict(gain=0.25, noise_rate=900, scatter=0.18)
+
+sim_train = ms.generate_dataset(6000, seed=0, progress=True)
+sim_val   = ms.generate_dataset(1000, seed=1)
+dat_train = ms.generate_dataset(1200, seed=10, **DATA_DOMAIN)
+dat_val   = ms.generate_dataset(1000, seed=11, **DATA_DOMAIN)
+
+ms.summarize(sim_train, "SIMULATION")
+print()
+ms.summarize(dat_train, "REAL DATA (shifted)")
+
+#%% code
+fig, axes = plt.subplots(2, 4, figsize=(10, 5.2))
+for k in range(4):
+    ms.plot_event(sim_train, k, axes[0, k], "charge")
+    ms.plot_event(dat_train, k, axes[1, k], "charge")
+axes[0, 0].set_ylabel("simulation", fontsize=10)
+axes[1, 0].set_ylabel("'real data'", fontsize=10)
+fig.tight_layout(); plt.show()
+
+#%% md
+The physics is the same and the pictures are obviously different: occupancy is
+several times higher, charges are smaller, showers are fluffier. A physicist
+looking at these would have no trouble classifying either set. Let us see how the
+network does.
+
+#%% code
+CHARGE_SCALE = float(np.percentile(sim_train["image"][sim_train["image"] > 0], 99))
+
+
+def prepare(ds):
+    return (torch.tensor(ds["image"])[:, None] / CHARGE_SCALE,
+            torch.tensor(ds["label"]))
+
+
+Xs, Ys   = prepare(sim_train)
+Xsv, Ysv = prepare(sim_val)
+Xd, Yd   = prepare(dat_train)
+Xdv, Ydv = prepare(dat_val)
+
+
+def conv_block(cin, cout):
+    return nn.Sequential(
+        nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(),
+        nn.Conv2d(cout, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU(),
+        nn.MaxPool2d(2))
+
+
+class Net(nn.Module):
+    """Encoder + small head -- the reusable/disposable split from Notebook 1."""
+
+    def __init__(self, ch=24):
+        super().__init__()
+        self.encoder = nn.Sequential(conv_block(1, ch), conv_block(ch, ch),
+                                     conv_block(ch, ch), conv_block(ch, ch))
+        self.head = nn.Sequential(nn.Linear(ch, 32), nn.ReLU(), nn.Linear(32, 3))
+
+    def forward(self, x):
+        return self.head(self.encoder(x).amax(dim=(2, 3)))
+
+
+@torch.no_grad()
+def accuracy(model, X, Y, bs=256):
+    model.eval()
+    return sum((model(X[i:i + bs].to(DEVICE)).argmax(1).cpu() == Y[i:i + bs]).sum().item()
+               for i in range(0, len(X), bs)) / len(X)
+
+
+def fit(model, X, Y, steps, lr, bs=32, params=None):
+    """Train for a fixed number of optimiser steps, so runs with different
+    dataset sizes get the same optimisation budget and remain comparable."""
+    ps = list(params) if params is not None else list(model.parameters())
+    opt = torch.optim.AdamW(ps, lr=lr, weight_decay=1e-2)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps,
+                                                pct_start=0.2)
+    model.train()
+    perm, i = torch.randperm(len(X)), 0
+    for _ in range(steps):
+        if i + bs > len(X):
+            perm, i = torch.randperm(len(X)), 0
+        b = perm[i:i + bs]; i += bs
+        if len(b) < 2:
+            continue
+        opt.zero_grad()
+        F.cross_entropy(model(X[b].to(DEVICE)), Y[b].to(DEVICE)).backward()
+        opt.step(); sched.step()
+    return model
+
+
+t0 = time.time()
+torch.manual_seed(0)
+pretrained = fit(Net().to(DEVICE), Xs, Ys, steps=800, lr=2e-3, bs=64)
+print(f"pretrained on 6000 simulated events in {time.time() - t0:.0f} s")
+
+#%% md
+## 2. Measure the gap
+
+#%% code
+acc_sim = accuracy(pretrained, Xsv, Ysv)
+acc_dat = accuracy(pretrained, Xdv, Ydv)
+print(f"accuracy on SIMULATION validation : {acc_sim:.3f}")
+print(f"accuracy on REAL DATA             : {acc_dat:.3f}   <-- chance is 0.333")
+print(f"\nthe gap: {acc_sim - acc_dat:.3f}")
+
+#%% md
+This is the single most important plot-that-is-not-a-plot in applied physics ML.
+
+The model is essentially perfect on the distribution it was trained on and close
+to useless on the one you care about. **Nothing in the standard workflow would
+have caught this.** The training loss went down; the validation loss went down;
+the validation accuracy was 0.99. Every diagnostic from Notebook 2 says this run
+is healthy — because every diagnostic was computed on simulation.
+
+> **The rule:** your validation set must come from the distribution you will
+> deploy on. If it cannot (because you have no labels there), then measuring the
+> domain gap becomes a first-class task in its own right, not an afterthought.
+>
+> This is the same failure as the MLP in Notebook 0, which looked 94 % accurate
+> until the event moved, and the OrderedMLP in Notebook 3, which looked fine
+> until the hits were relabelled. Three notebooks, three costumes, one mistake:
+> **validating on the same distribution you trained on tells you nothing about
+> the thing you actually want to know.**
+
+## 3. Remedy 0 — recalibrate the normalisation statistics (free, no labels)
+
+Before anything expensive, try the cheapest possible fix.
+
+Recall what a BatchNorm layer does at inference: it subtracts a **running mean**
+and divides by a **running variance** that were accumulated during training —
+on simulation. Our real data has higher occupancy and lower charges, so the
+activation statistics inside the network are simply different, and every
+BatchNorm layer in the model is now normalising with the wrong constants. The
+error compounds through depth.
+
+The fix is embarrassing in its simplicity: **run the model forward over
+unlabelled real data with the BatchNorm layers in training mode, so they
+re-estimate their statistics, and change nothing else.** No labels. No gradients.
+No optimiser. This is known as AdaBN (Li et al., 2016).
+
+#%% code
+def recalibrate_bn(model, X, n_batches=16, bs=64):
+    """Re-estimate BatchNorm running statistics on (unlabelled) target data."""
+    model = copy.deepcopy(model)         # leave the original model untouched
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.reset_running_stats()      # throw away the simulation statistics
+            m.momentum = None            # None = plain cumulative average, so the
+                                         #   estimate uses every batch we show it
+                                         #   equally instead of decaying old ones
+    # The two lines that make this work, and they look contradictory:
+    #   .train() puts BatchNorm in the mode where it UPDATES its running stats
+    #   no_grad() means nothing else about the model changes -- no optimiser, no
+    #   gradients, no labels. We are only re-measuring the activation statistics.
+    model.train()
+    with torch.no_grad():
+        for i in range(n_batches):
+            model(X[i * bs:(i + 1) * bs].to(DEVICE))
+    return model
+
+
+adapted = recalibrate_bn(pretrained, Xd, n_batches=16)
+
+print(f"before recalibration : {accuracy(pretrained, Xdv, Ydv):.3f}")
+print(f"after  recalibration : {accuracy(adapted, Xdv, Ydv):.3f}")
+print(f"labels used          : 0")
+print(f"gradient steps       : 0")
+print(f"events seen          : {16 * 64}  (unlabelled)")
+print(f"\nstill on simulation  : {accuracy(adapted, Xsv, Ysv):.3f}  "
+      f"(was {acc_sim:.3f} -- you cannot have both sets of statistics at once)")
+
+#%% md
+Most of the gap, closed for nothing.
+
+**Why it works so well here:** our domain shift is largely a shift in *activation
+statistics* — everything is dimmer and busier. The features the encoder learned
+(edges, line-like structure, diffuse blobs) are still the right features; they
+were merely being normalised against the wrong reference. Once the reference is
+corrected, the model works again.
+
+**Do not over-generalise from this.** Two honest caveats:
+
+- **It only fixes statistical shifts.** If your real detector has a dead region,
+  a different geometry, or a particle species your simulation omits, no amount of
+  renormalising will help — the features themselves are wrong.
+- **It is not free of consequences.** The recalibrated model is now *worse* on
+  simulation, as the last line shows. There is one set of running statistics and
+  it has to belong to one domain. If you need a single model for both, that is a
+  design problem, not a bug.
+
+Still: it costs one function and zero labels. **Try it before anything else**,
+and if a colleague's sim-trained model is underperforming on data, this is the
+first question to ask.
+
+The more general point is worth stating plainly, because it generalises far
+beyond BatchNorm: **check the boring explanations first.** A large fraction of
+apparent "domain gap" is preprocessing, calibration, and normalisation
+constants — not deep incompatibility between simulation and reality.
+
+## 4. Remedy 1 — fine-tuning: what a pretrained encoder is worth
+
+Now suppose the shift is not purely statistical, or you simply want the best
+model you can get, and you have managed to hand-label a few hundred real events.
+
+Three strategies:
+
+| strategy | what trains | when |
+|---|---|---|
+| **from scratch** | everything, random init | plenty of target labels |
+| **linear probe** | the head only; encoder frozen | very few labels, or you want a cheap, stable baseline |
+| **fine-tune** | everything, from the pretrained weights, at a **much lower** learning rate | the usual best choice |
+
+The learning rate for fine-tuning is the detail people get wrong. Use your normal
+rate and the first few large gradient steps will destroy the pretrained features
+before they can be useful — **catastrophic forgetting**. A factor of 10 lower
+than you would use from scratch is the standard starting point; we use $2\times
+10^{-4}$ against $2\times 10^{-3}$.
+
+Every configuration below gets the **same number of optimiser steps**, so the
+comparison is about the initialisation, not the compute.
+
+#%% code
+N_LABELS = [25, 50, 100, 250, 600]
+SEEDS = [1, 2]
+STEPS = 500
+curves = {"from scratch": [], "linear probe": [], "fine-tune": []}
+
+t0 = time.time()
+for n in N_LABELS:
+    scores = {k: [] for k in curves}
+    for seed in SEEDS:
+        torch.manual_seed(seed)
+        scores["from scratch"].append(accuracy(
+            fit(Net().to(DEVICE), Xd[:n], Yd[:n], STEPS, lr=2e-3), Xdv, Ydv))
+
+        torch.manual_seed(seed)
+        probe = copy.deepcopy(pretrained)
+        for p in probe.encoder.parameters():
+            p.requires_grad = False
+        scores["linear probe"].append(accuracy(
+            fit(probe, Xd[:n], Yd[:n], STEPS, lr=1e-3, params=probe.head.parameters()),
+            Xdv, Ydv))
+
+        torch.manual_seed(seed)
+        scores["fine-tune"].append(accuracy(
+            fit(copy.deepcopy(pretrained), Xd[:n], Yd[:n], STEPS, lr=2e-4), Xdv, Ydv))
+    for k in curves:
+        curves[k].append(scores[k])
+    print(f"n = {n:>4} labelled events   " + "   ".join(
+        f"{k} {np.mean(scores[k]):.3f}" for k in curves))
+print(f"\n{time.time() - t0:.0f} s")
+
+#%% code
+fig, ax = plt.subplots(figsize=(7, 4.4))
+for (name, vals), style in zip(curves.items(), ["o-", "s-", "^-"]):
+    v = np.array(vals)
+    ax.plot(N_LABELS, v.mean(1), style, label=name)
+    ax.fill_between(N_LABELS, v.min(1), v.max(1), alpha=0.15)
+ax.axhline(accuracy(adapted, Xdv, Ydv), ls="--", c="grey",
+           label="BN recalibration (0 labels)")
+ax.axhline(1 / 3, ls=":", c="black", lw=0.8)
+ax.set_xscale("log")
+ax.set_xlabel("number of labelled real events")
+ax.set_ylabel("accuracy on real data")
+ax.set_title("what a pretrained encoder is worth", fontsize=10)
+ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.show()
+
+#%% md
+### Reading the curve
+
+**At 25 labelled events**, training from scratch is barely above chance while
+both transfer strategies are already near their ceiling. The encoder learned what
+tracks and showers look like from simulation, and that knowledge survives the
+domain shift even though the raw appearance changed a lot.
+
+**The two curves converge**, and where they cross is the number you actually care
+about: below it, pretraining is decisive; above it, you may as well train from
+scratch. Here that is a few hundred events. **A pretrained encoder is worth
+roughly an order of magnitude in labelled data** — which, when labels come from
+hand-scanning, is the difference between a feasible and an infeasible project.
+
+**Linear probing is nearly as good as full fine-tuning here**, which tells you
+the pretrained features are already close to sufficient — only the decision
+boundary needed adjusting. When full fine-tuning substantially beats a linear
+probe, that is evidence the *features themselves* need to change, i.e. a deeper
+domain shift.
+
+**And note where the dashed line sits.** Zero-label BatchNorm recalibration is
+competitive with a few hundred hand-labelled events. Order your remedies by cost.
+
+### Practical notes on fine-tuning
+
+- **Lower the learning rate**, typically 10×. Then check the update ratio from
+  Notebook 2 — you want the pretrained weights nudged, not overwritten.
+- **Discriminative learning rates.** Early layers learn generic features (edges,
+  texture) that transfer well; late layers are task-specific. A common recipe is
+  a very small LR for early layers rising towards the head.
+- **Freeze, then unfreeze.** Train the head alone for a few hundred steps so it
+  is not random, *then* unfreeze the encoder. A randomly-initialised head produces
+  large gradients that will wreck good features on the first step.
+- **Watch the BatchNorm layers.** During fine-tuning they will re-estimate
+  statistics on the target domain, which is usually what you want — it is
+  Remedy 0 happening automatically. If you fine-tune on very few events, those
+  statistics are noisy, and freezing BN (`m.eval()`) is often better.
+- **Keep a simulation validation set too.** If simulation accuracy collapses
+  while target accuracy rises, you are memorising 25 events, not adapting.
+
+## 5. What none of this fixes
+
+Transfer learning solves a *labelling* problem. It does not solve a *physics*
+problem, and in a physics analysis the difference is where your systematic
+uncertainty lives.
+
+**Your model inherits your simulation's assumptions.** The encoder learned what a
+shower looks like *according to your generator*. If the generator's shower model
+is wrong, that error is now baked into learned features, and fine-tuning on 200
+real events will not remove it — it will adjust the decision boundary on top of
+biased features. Whatever you would have assigned as a modelling systematic, you
+must still assign.
+
+**Negative transfer is real.** If the source task is unrelated to the target,
+pretraining can be *worse* than random initialisation. Test it; do not assume.
+
+**A pretrained model is not calibrated on the target domain.** Even at high
+accuracy, the output probabilities will be miscalibrated after a domain shift. If
+you use network outputs as likelihoods, or cut on them at a specific efficiency,
+you must recalibrate on target-domain data — and that needs labels.
+
+**Selection effects hide in your labelled sample.** Hand-scanned events are
+usually not a random sample of real data: humans label events they can
+understand, which means clean, well-separated topologies. Fine-tuning on them
+teaches the model about easy events. This is the same class of problem as the
+truncation bias in Notebook 3, and it is much harder to see.
+
+**What to do when you have no labels at all** is a genuine research area
+(unsupervised domain adaptation): adversarial feature alignment, self-training on
+confident predictions, consistency regularisation, and — increasingly — improving
+the simulation itself using generative models, which is Lecture 3's territory.
+Remedy 0 is the cheap and reliable member of that family, which is why it came
+first.
+
+## 6. Takeaways
+
+1. **Validating on simulation tells you nothing about data.** Ours was 0.99 on
+   simulation and near chance on the target domain, with every training
+   diagnostic looking healthy.
+2. **Measure the domain gap explicitly.** It is a first-class result, not a
+   footnote.
+3. **Try the cheap fix first.** Recalibrating BatchNorm statistics on unlabelled
+   target data used zero labels and zero gradient steps and recovered most of the
+   gap.
+4. **A pretrained encoder is worth roughly 10× in labelled data**, and the
+   advantage is largest exactly where you are most constrained.
+5. **Fine-tune at a much lower learning rate**, or you will erase what you are
+   trying to reuse.
+6. **A linear probe that matches full fine-tuning** means your features already
+   transfer; a large gap means they do not.
+7. **Transfer fixes labels, not physics.** Simulation bias, calibration, and
+   selection effects in your labelled sample all survive it.
+
+## 7. Exercises
+
+1. **Which shift hurts most?** Vary `DATA_DOMAIN` one parameter at a time — gain
+   only, noise only, scattering only — and measure the gap for each. Then check
+   which of them BN recalibration can fix. Form a hypothesis about *why* before
+   you run it.
+2. **How many unlabelled events does Remedy 0 need?** Sweep `n_batches` from 1 to
+   64. The answer is probably smaller than you expect, which matters when target
+   data is rate-limited.
+3. **Catastrophic forgetting, demonstrated.** Fine-tune at $2\times10^{-3}$
+   instead of $2\times10^{-4}$ with n = 25 and watch what happens. Track accuracy
+   on *both* domains during training.
+4. **Freeze-then-unfreeze.** Implement the two-stage recipe from §4 and see
+   whether it beats one-shot fine-tuning at n = 25.
+5. **Augment the gap away.** Instead of transferring, train on simulation with
+   augmentation that mimics the shift — random gain, extra noise hits. How close
+   does that get you, with zero real events? (This is *domain randomisation*, and
+   it is what you do when you cannot get target data at all.)
+6. **Negative transfer.** Pretrain on a deliberately unrelated task — predict the
+   index of the event in the file — and then fine-tune. Confirm it is worse than
+   random initialisation.
