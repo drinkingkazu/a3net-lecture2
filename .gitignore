@@ -10,3 +10,6 @@ LECTURE_PLAN.md
 pdfs/
 # local tool settings, not part of the course material
 .claude/
+
+# safety net: an accidental clone of this repo inside itself
+a3net-lecture2/

@@ -58,26 +58,48 @@ def _cell(kind, source):
             "outputs": [], "source": lines}
 
 
-SETUP_CELL = """# --- setup: fetch the course package (run once per session) -----------------
-# On Colab this clones the repository and installs it. Locally, if `mlschool` is
-# already importable, it does nothing. Safe to re-run.
+SETUP_CELL = """# --- setup: make the course package importable (run once per session) ------
+# On Colab: clones the repository and installs it.
+# Locally inside a checkout: finds it and uses it in place -- no second copy.
+# Already importable: does nothing. Safe to re-run either way.
 REPO_URL = "{repo_url}"
 REPO_DIR = "{repo_dir}"
 
 import os, subprocess, sys
 
+
+def _find_checkout(start=None):
+    \"\"\"Walk up from `start` looking for a directory containing mlschool/.\"\"\"
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.isfile(os.path.join(d, "mlschool", "__init__.py")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
 try:
-    import mlschool
+    import mlschool                       # already installed, or already on sys.path
 except ModuleNotFoundError:
-    if not os.path.isdir(REPO_DIR):
-        subprocess.run(["git", "clone", "--depth", "1", REPO_URL, REPO_DIR], check=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", REPO_DIR],
-                   check=True)
-    sys.path.insert(0, os.path.abspath(REPO_DIR))     # belt and braces
+    root = _find_checkout()               # are we sitting inside the repo already?
+    if root is None:                      # no -- fetch it (this is the Colab path)
+        if not os.path.isdir(REPO_DIR):
+            subprocess.run(["git", "clone", "--depth", "1", REPO_URL, REPO_DIR],
+                           check=True)
+        root = os.path.abspath(REPO_DIR)
+        try:                              # nice-to-have; sys.path below is enough
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", root],
+                           check=True)
+        except subprocess.CalledProcessError:
+            print("pip install failed; falling back to sys.path (usually fine)")
+    sys.path.insert(0, root)
     import mlschool
 
 import mlschool as ms
-print("mlschool", ms.__version__, "| device:", ms.device())"""
+print("mlschool", ms.__version__, "from", os.path.dirname(ms.__file__))
+print("device:", ms.device())"""
 
 
 def _setup():

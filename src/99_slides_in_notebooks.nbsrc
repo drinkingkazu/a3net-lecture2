@@ -100,7 +100,7 @@ This is the cell you drop into the middle of a lecture notebook. Click
 **Next ▶** / **◀ Prev**, or drag the slider.
 
 #%% code
-deck = slidekit.SlideDeck("demo_slides", width=760)
+deck = slidekit.SlideDeck("demo_slides")      # width defaults to "100%"
 print(f"{len(deck)} slides loaded")
 deck.show(start=0)
 
@@ -111,14 +111,55 @@ Some practical notes.
 several viewer cells through the notebook, each opening at the relevant slide,
 all sharing one deck object.
 
+**Width follows the window by default.** `width` accepts either a pixel count or
+any CSS length, and defaults to `"100%"`, so the deck fills the output area and
+re-flows when the window is resized or the projector resolution changes:
+
+```python
+ms.slides.SlideDeck("slides/NB1/intro")               # "100%"  -- responsive
+ms.slides.SlideDeck("slides/NB1/intro", width="80vw") # 80% of the viewport
+ms.slides.SlideDeck("slides/NB1/intro", width=760)    # fixed 760 px
+deck.show(start=3, width="60%")                       # or override per viewer
+```
+
+Height is deliberately left unset, so the aspect ratio is preserved whatever the
+width. (Internally this has to go through the widget's CSS `layout`, not its
+`width` trait — the trait becomes an HTML `width` attribute, which accepts only
+integers and silently ignores `"100%"`.)
+
 **Widget output is not saved into the `.ipynb`.** If somebody opens the notebook
 on GitHub without running it, the viewer area will be blank. That is a property
 of all ipywidgets, not of this helper. When the notebook needs to be *readable*
 rather than *runnable*, use the static form below — the images are embedded as
 base64 and survive export to HTML and PDF.
 
+> ### If you see `Error displaying widget: model not found`
+>
+> This is the same fact wearing a scarier hat, and it is **not** a broken
+> installation. A widget is a live object owned by the kernel; the notebook file
+> stores only a *reference* to it. So the message appears whenever the reference
+> outlives the object:
+>
+> - you re-opened a saved notebook without re-running the cell;
+> - the kernel was restarted after the cell ran;
+> - the notebook was executed headlessly (`nbconvert`) and you are viewing the
+>   result.
+>
+> **Fix: re-run the cell.** Nothing else is required.
+>
+> If you would rather not depend on a live kernel at all — projecting from a
+> saved file, exporting to PDF, or a frontend that simply will not cooperate —
+> switch the deck to images:
+>
+> ```python
+> deck.show(start=0, static=True)      # this deck, this call
+> ms.slides.USE_STATIC = True          # or globally, once, for every deck
+> ```
+>
+> You lose the Prev/Next buttons and get the single requested slide instead.
+
 #%% code
-deck.show_static([0, 3], width=520)
+deck.show_static([0, 3], width="60%")
 
 #%% md
 ## Alternative — embed hosted slides directly

@@ -27,7 +27,7 @@ Typical use::
 
     import mlschool as ms
     # once, offline:  ms.slides.pdf_to_images("lecture2.pdf", "slides/")
-    deck = ms.slides.SlideDeck("slides/")
+    deck = ms.slides.SlideDeck("slides/")        # width defaults to "100%"
     deck.show(start=12)          # drop this cell wherever you want the slides
 """
 
@@ -35,6 +35,12 @@ import glob
 import os
 import shutil
 import subprocess
+
+#: Global escape hatch. Set ``ms.slides.USE_STATIC = True`` to make every
+#: ``SlideDeck.show()`` render plain images instead of an interactive widget.
+#: Useful when exporting a notebook to HTML/PDF, and when a frontend cannot
+#: display widgets at all.
+USE_STATIC = False
 
 
 # --------------------------------------------------------------------------
@@ -75,15 +81,29 @@ def pdf_to_images(pdf_path, out_dir, dpi=110, prefix="slide"):
         "  apt-get install poppler-utils  (provides pdftoppm)")
 
 
+def _css_width(width):
+    """Accept 760 (pixels) or any CSS length string: "100%", "80vw", "40em"."""
+    if isinstance(width, (int, float)):
+        return f"{int(width)}px"
+    return str(width)
+
+
 # --------------------------------------------------------------------------
 # the viewer
 # --------------------------------------------------------------------------
 class SlideDeck:
-    """A clickable slide viewer for a directory (or list) of images."""
+    """A clickable slide viewer for a directory (or list) of images.
+
+    `width` may be a number of pixels (``760``) or any CSS length
+    (``"100%"``, ``"80vw"``). ``"100%"`` makes the deck fill the notebook's
+    output area and follow the window as it is resized, which is usually what
+    you want when projecting. Height is left unset so the aspect ratio is
+    preserved.
+    """
 
     PATTERNS = ("*.png", "*.jpg", "*.jpeg", "*.svg")
 
-    def __init__(self, images, width=900):
+    def __init__(self, images, width="100%"):
         if isinstance(images, str):
             found = self._scan(images)
             if not found:
@@ -116,27 +136,38 @@ class SlideDeck:
             data = fh.read()
         return data, path.lower().endswith(".svg")
 
-    def show(self, start=0, width=None):
+    def show(self, start=0, width=None, static=None):
         """Interactive viewer: Prev / Next buttons plus a slider.
 
-        Needs a live kernel. In a statically rendered notebook (GitHub,
-        nbviewer) the widget cannot run, so `show` falls back to printing the
-        slides as static images -- see `show_static`.
+        Requires a LIVE KERNEL. A widget is a live object owned by the kernel;
+        the notebook file stores only a reference to it. So if you re-open a
+        saved notebook, or restart the kernel, the browser reports
+
+            Error displaying widget: model not found
+
+        That is expected, and it is not a broken installation: just re-run the
+        cell. If you need output that survives saving, use ``static=True`` (or
+        set ``mlschool.slides.USE_STATIC = True`` once, for every deck).
         """
+        if static or (static is None and USE_STATIC):
+            return self.show_static([start], width=width)
         try:
             import ipywidgets as W
         except ImportError:
             print("ipywidgets not installed; falling back to static output.")
-            return self.show_static([start])
+            return self.show_static([start], width=width)
 
         from IPython.display import display
 
-        width = width or self.width
-        img = W.Image(width=width)
+        css = _css_width(width or self.width)
+        # Set the CSS width via `layout`, NOT the `width` trait: the trait becomes
+        # an HTML width attribute, which only accepts integers, so "100%" there is
+        # silently ignored. height stays unset so the aspect ratio is preserved.
+        img = W.Image(layout=W.Layout(width=css, height="auto", max_width="100%"))
         caption = W.HTML()
         slider = W.IntSlider(value=start, min=0, max=len(self) - 1,
                              description="slide", continuous_update=True,
-                             layout=W.Layout(width=f"{width}px"))
+                             layout=W.Layout(width=css, max_width="100%"))
         prev_b = W.Button(description="◀ Prev", layout=W.Layout(width="90px"))
         next_b = W.Button(description="Next ▶", layout=W.Layout(width="90px"))
 
@@ -156,7 +187,8 @@ class SlideDeck:
         render(start)
         display(W.VBox([img, caption,
                         W.HBox([prev_b, next_b, slider])],
-                       layout=W.Layout(align_items="center")))
+                       layout=W.Layout(align_items="center", width=css,
+                                       max_width="100%")))
         return None
 
     def show_static(self, indices=None, width=None):
@@ -166,7 +198,7 @@ class SlideDeck:
         survive into HTML/PDF exports and GitHub previews, which widgets do not.
         """
         from IPython.display import HTML, display
-        width = width or self.width
+        css = _css_width(width or self.width)
         indices = range(len(self)) if indices is None else indices
         for i in indices:
             data, is_svg = self._payload(i)
@@ -175,14 +207,15 @@ class SlideDeck:
             else:
                 import base64
                 b64 = base64.b64encode(data).decode()
+                # style, not the width attribute, so percentages work here too
                 display(HTML(f"<img src='data:image/png;base64,{b64}' "
-                             f"width='{width}'>"))
+                             f"style='width:{css};max-width:100%;height:auto'>"))
 
 
 # --------------------------------------------------------------------------
 # iframe embedding
 # --------------------------------------------------------------------------
-def embed_url(url, width=900, height=560):
+def embed_url(url, width="100%", height=560):
     """Embed hosted slides (Google Slides, reveal.js export, a PDF on the web).
 
     For Google Slides use *File -> Share -> Publish to the web -> Embed* and
