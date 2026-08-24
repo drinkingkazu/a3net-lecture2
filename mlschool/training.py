@@ -141,33 +141,58 @@ def dead_fraction(model, xb, dev=None):
 def fit_instrumented(name, model, X, Y, Xval, Yval, epochs=6, lr=1e-3, bs=64,
                      optimizer="adam", weight_decay=0.0, shuffle=True,
                      augment=False, scheduler=None, clip=None, seed=0,
-                     n_classes=3, dev=None, verbose=False):
-    """Train while logging the five quantities from notebook 2 §1.
+                     n_classes=3, dev=None, verbose=False, light=False,
+                     log_every=1 / 20):
+    """Train while logging the quantities from notebook 2 §1.
 
-    Returns a history dict: train_loss, val_loss, val_acc, grad_norm,
-    update_ratio, dead, lr -- one entry per epoch.
+    Two resolutions, because the two kinds of quantity cost very different
+    amounts to measure:
+
+    * **train-side** (`train_loss`, `grad_norm`, `update_ratio`) are computed on
+      every step anyway, so recording them `log_every` epochs apart is free.
+      Sub-epoch resolution matters: a run whose data was never shuffled shows a
+      sawtooth with one tooth per class, and averaging over an epoch hides it.
+    * **validation** (`val_loss`, `val_acc`) and `dead` need extra forward
+      passes, so they stay at epoch boundaries.
+
+    The two share one x-axis in units of epochs: `step_epoch` for the fine
+    series, `epoch` for the coarse ones.
+
+    `model` may be a module or a zero-argument factory. Prefer the factory: the
+    network is then built AFTER the seed is set, so the run reproduces whatever
+    happened earlier in the notebook.
+
+    `light=True` skips the per-step update-ratio bookkeeping, which copies every
+    parameter twice per step, for runs where only the final accuracy matters.
     """
     import torch
+    import torch.nn as nn
     import torch.nn.functional as F
     dev = dev or device()
     torch.manual_seed(seed)
+    if not isinstance(model, nn.Module):
+        model = model()                       # build after seeding
     model = model.to(dev)
     opt = _make_optimizer(model, optimizer, lr, weight_decay)
+
     n = len(X)
-    steps = epochs * int(np.ceil(n / bs))
+    per_epoch = int(np.ceil(n / bs))
+    steps = epochs * per_epoch
+    every = max(1, int(round(log_every * per_epoch)))     # steps between samples
     sched = (torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=lr, total_steps=steps, pct_start=0.15)
-        if scheduler == "onecycle" else None)
+        if scheduler in ("onecycle", "cosine") else None)
 
     order = torch.argsort(Y) if not shuffle else None
-    h = {k: [] for k in ["train_loss", "val_loss", "val_acc",
-                         "grad_norm", "update_ratio", "dead", "lr"]}
+    h = {k: [] for k in ("step_epoch", "train_loss", "grad_norm", "update_ratio",
+                         "epoch", "val_loss", "val_acc", "dead", "lr")}
+    acc = {"loss": 0.0, "g": 0.0, "u": 0.0, "k": 0}       # running bucket
+    step = 0
     t0 = time.time()
+
     for _ in range(epochs):
         model.train()
         perm = order if order is not None else torch.randperm(n)
-        tot = gsum = usum = 0.0
-        nb = 0
         for i in range(0, n, bs):
             b = perm[i:i + bs]
             if len(b) < 2:
@@ -178,29 +203,49 @@ def fit_instrumented(name, model, X, Y, Xval, Yval, epochs=6, lr=1e-3, bs=64,
             loss.backward()
             gnorm = float(torch.nn.utils.clip_grad_norm_(
                 model.parameters(), clip if clip else 1e12))
-            before = torch.cat([p.detach().flatten() for p in model.parameters()])
-            opt.step()
-            after = torch.cat([p.detach().flatten() for p in model.parameters()])
-            tot += loss.item() * len(b)
-            gsum += gnorm
-            usum += float((after - before).norm() / before.norm().clamp(min=1e-12))
-            nb += 1
+            if light:
+                opt.step()
+            else:
+                before = torch.cat([p.detach().flatten()
+                                    for p in model.parameters()])
+                opt.step()
+                after = torch.cat([p.detach().flatten()
+                                   for p in model.parameters()])
+                acc["u"] += float((after - before).norm()
+                                  / before.norm().clamp(min=1e-12))
+            acc["loss"] += loss.item()
+            acc["g"] += gnorm
+            acc["k"] += 1
+            step += 1
             if sched:
                 sched.step()
 
-        logits = predict_logits(model, Xval, dev=dev)
-        h["train_loss"].append(tot / n)
+            if acc["k"] >= every:                          # flush a fine sample
+                h["step_epoch"].append(step / per_epoch)
+                h["train_loss"].append(acc["loss"] / acc["k"])
+                h["grad_norm"].append(acc["g"] / acc["k"])
+                h["update_ratio"].append(acc["u"] / acc["k"])
+                acc = {"loss": 0.0, "g": 0.0, "u": 0.0, "k": 0}
+
+        if acc["k"]:                                       # partial bucket
+            h["step_epoch"].append(step / per_epoch)
+            h["train_loss"].append(acc["loss"] / acc["k"])
+            h["grad_norm"].append(acc["g"] / acc["k"])
+            h["update_ratio"].append(acc["u"] / acc["k"])
+            acc = {"loss": 0.0, "g": 0.0, "u": 0.0, "k": 0}
+
+        logits = predict_logits(model, Xval, dev=dev)      # once per epoch
+        h["epoch"].append(step / per_epoch)
         h["val_loss"].append(float(F.cross_entropy(logits, Yval)))
         h["val_acc"].append(float((logits.argmax(1) == Yval).float().mean()))
-        h["grad_norm"].append(gsum / nb)
-        h["update_ratio"].append(usum / nb)
-        h["dead"].append(dead_fraction(model, X[:64], dev))
+        h["dead"].append(0.0 if light else dead_fraction(model, X[:64], dev))
         h["lr"].append(opt.param_groups[0]["lr"])
         if verbose:
-            print(f"  ep {len(h['train_loss'])}/{epochs}  "
+            print(f"  ep {len(h['epoch'])}/{epochs}  "
                   f"train {h['train_loss'][-1]:.4f}  val {h['val_loss'][-1]:.4f}  "
                   f"acc {h['val_acc'][-1]:.3f}  |g| {h['grad_norm'][-1]:.2e}  "
                   f"upd {h['update_ratio'][-1]:.1e}")
+
     h["name"], h["seconds"], h["n_classes"] = name, time.time() - t0, n_classes
     h["model"] = model
     print(f"{name:<34} final val acc {h['val_acc'][-1]:.3f}   ({h['seconds']:.0f} s)")

@@ -60,22 +60,6 @@ below is only the code that carries an idea.
 
 #%% setup
 
-#%% code
-import time
-import numpy as np
-import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("torch", torch.__version__, "| device:", DEVICE)
-if DEVICE == "cpu":
-    print("No GPU found. Everything still runs, roughly 5x slower.")
-
 #%% md
 ## 1. The detector and the data
 

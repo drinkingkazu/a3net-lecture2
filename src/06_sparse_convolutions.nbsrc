@@ -72,13 +72,7 @@ U-Nets over full detector volumes that could never be held densely in memory.
 #%% setup
 
 #%% code
-import time
 import gc
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
 
 try:
@@ -90,10 +84,7 @@ except ImportError:
         "spconv and adapt the API names."
     )
 
-torch.manual_seed(0)
-np.random.seed(0)
 assert torch.cuda.is_available(), "MinkowskiEngine needs a GPU."
-DEVICE = "cuda"
 print("MinkowskiEngine", ME.__version__, "| torch", torch.__version__)
 print("GPU:", torch.cuda.get_device_name(0))
 
@@ -294,77 +285,18 @@ print(f"sparse parameters {sum(p.numel() for p in SparseNet().parameters()):,}")
 print(f"dense  parameters {sum(p.numel() for p in make_dense().parameters()):,}")
 
 #%% code
-def mem_baseline():
-    """Peak-memory bookkeeping.
+# Timing and peak-memory bookkeeping is fiddly (CUDA's high-water mark is
+# process-wide, so it must be measured as an increment) and it is not the
+# lesson. `ms.sparse` does it: train_sparse_classifier / train_dense_classifier
+# both return (accuracy, seconds, peak_MB) measured identically.
+train_dense_fn = lambda: ms.sparse.train_dense_classifier(
+    make_dense(), torch.tensor(train["image"])[:, None] / CHARGE_SCALE, Ytr,
+    torch.tensor(val["image"])[:, None] / CHARGE_SCALE, Yva)
+train_sparse_fn = lambda: ms.sparse.train_sparse_classifier(
+    SparseNet(), sp_train, Ytr, sp_val, Yva)
 
-    `max_memory_allocated` is a process-wide high-water mark, so anything still
-    resident from an earlier cell would be counted against whichever model we
-    happen to measure next. We record the baseline and report the *increment*,
-    which is the only number that means anything in a shared process.
-    """
-    gc.collect(); torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    return torch.cuda.memory_allocated()
-
-
-def mem_used(base):
-    return (torch.cuda.max_memory_allocated() - base) / 1e6
-
-
-def train_sparse(epochs=6, bs=64, lr=2e-3):
-    torch.manual_seed(0)
-    model = SparseNet().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    base = mem_baseline()
-    t0 = time.time()
-    for ep in range(epochs):
-        model.train()
-        perm = torch.randperm(len(sp_train))
-        for i in range(0, len(perm), bs):
-            idx = perm[i:i + bs].tolist()
-            opt.zero_grad()
-            F.cross_entropy(model(make_batch(sp_train, idx)),
-                            Ytr[idx].to(DEVICE)).backward()
-            opt.step()
-    secs, mem = time.time() - t0, mem_used(base)
-    model.eval()
-    correct = 0
-    with torch.no_grad():
-        for i in range(0, len(sp_val), 64):
-            idx = list(range(i, min(i + 64, len(sp_val))))
-            correct += (model(make_batch(sp_val, idx)).argmax(1).cpu()
-                        == Yva[idx]).sum().item()
-    return correct / len(sp_val), secs, mem
-
-
-def train_dense(epochs=6, bs=64, lr=2e-3):
-    X = torch.tensor(train["image"])[:, None] / CHARGE_SCALE
-    XV = torch.tensor(val["image"])[:, None] / CHARGE_SCALE
-    torch.manual_seed(0)
-    model = make_dense().to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    base = mem_baseline()
-    t0 = time.time()
-    for ep in range(epochs):
-        model.train()
-        perm = torch.randperm(len(X))
-        for i in range(0, len(perm), bs):
-            b = perm[i:i + bs]
-            opt.zero_grad()
-            F.cross_entropy(model(X[b].to(DEVICE)), Ytr[b].to(DEVICE)).backward()
-            opt.step()
-    secs, mem = time.time() - t0, mem_used(base)
-    model.eval()
-    correct = 0
-    with torch.no_grad():
-        for i in range(0, len(XV), 128):
-            correct += (model(XV[i:i + 128].to(DEVICE)).argmax(1).cpu()
-                        == Yva[i:i + 128]).sum().item()
-    return correct / len(XV), secs, mem
-
-
-d_acc, d_s, d_m = train_dense()
-s_acc, s_s, s_m = train_sparse()
+d_acc, d_s, d_m = train_dense_fn()
+s_acc, s_s, s_m = train_sparse_fn()
 
 print(f"{'':8}{'accuracy':>10}{'train s':>10}{'peak MB':>10}")
 print("-" * 38)
@@ -485,7 +417,7 @@ def train_sparse_unet(epochs=4, bs=32, lr=2e-3):
     torch.manual_seed(0)
     model = SparseUNet().to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    base = mem_baseline()
+    base = ms.mem_baseline()
     t0 = time.time()
     for ep in range(epochs):
         model.train()
@@ -496,7 +428,7 @@ def train_sparse_unet(epochs=4, bs=32, lr=2e-3):
             opt.zero_grad()
             F.cross_entropy(model(x).F, y).backward()
             opt.step()
-    secs, peak = time.time() - t0, mem_used(base)
+    secs, peak = time.time() - t0, ms.mem_used(base)
     model.eval()
     preds, trues = [], []
     with torch.no_grad():
@@ -570,7 +502,7 @@ def bench(size, batch=32, ch=24):
     scale = float(np.percentile(ds["image"][ds["image"] > 0], 99))
 
     # --- dense
-    base = mem_baseline()
+    base = ms.mem_baseline()
     try:
         model = make_dense(ch).to(DEVICE)
         X = torch.tensor(ds["image"])[:, None].to(DEVICE) / scale
@@ -581,13 +513,13 @@ def bench(size, batch=32, ch=24):
             F.cross_entropy(model(X), y).backward()
         torch.cuda.synchronize()
         d_ms = (time.time() - t0) / 5 * 1000
-        d_mb = mem_used(base)
+        d_mb = ms.mem_used(base)
         del model, X
     except torch.cuda.OutOfMemoryError:
         d_ms, d_mb = float("nan"), float("nan")
 
     # --- sparse
-    base = mem_baseline()
+    base = ms.mem_baseline()
     items = to_sparse_list(ds, scale=scale)
     model = SparseNet(ch).to(DEVICE)
     for _ in range(3):
@@ -597,7 +529,7 @@ def bench(size, batch=32, ch=24):
         F.cross_entropy(model(make_batch(items, range(batch))), y).backward()
     torch.cuda.synchronize()
     s_ms = (time.time() - t0) / 5 * 1000
-    s_mb = mem_used(base)
+    s_mb = ms.mem_used(base)
     del model
     ME.clear_global_coordinate_manager()
     return hits, d_mb, d_ms, s_mb, s_ms

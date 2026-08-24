@@ -30,7 +30,9 @@ def asset(*parts):
     return str(ROOT.joinpath(*parts))
 
 
-from . import diagrams, metrics, plotting, slides, training
+# `sparse` imports MinkowskiEngine lazily (inside its functions), so listing
+# it here is safe even on Colab where ME is absent.
+from . import diagrams, metrics, plotting, points, slides, sparse, training
 from .data import (
     CLASS_NAMES,
     KINK_NAMES,
@@ -81,5 +83,16 @@ from .training import (
     predict_logits,
     shift_augment,
 )
+
+def hello():
+    """One-line environment report, printed by every notebook's setup cell."""
+    import os
+    import torch
+    dev = training.device()
+    print(f"mlschool {__version__} ({os.path.dirname(__file__)})  |  "
+          f"torch {torch.__version__}  |  device: {dev}")
+    if dev == "cpu":
+        print("No GPU found. Everything still runs, roughly 5x slower.")
+
 
 __version__ = "1.0.0"

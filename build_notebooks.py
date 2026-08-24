@@ -58,48 +58,31 @@ def _cell(kind, source):
             "outputs": [], "source": lines}
 
 
-SETUP_CELL = """# --- setup: make the course package importable (run once per session) ------
-# On Colab: clones the repository and installs it.
-# Locally inside a checkout: finds it and uses it in place -- no second copy.
-# Already importable: does nothing. Safe to re-run either way.
-REPO_URL = "{repo_url}"
-REPO_DIR = "{repo_dir}"
-
+SETUP_CELL = """# Setup. Nothing here is part of the lecture -- it just makes `mlschool`
+# importable (cloning the course repo if we are on Colab) and imports the usual
+# suspects. Run it and move on.
+REPO = "{repo_url}"
 import os, subprocess, sys
-
-
-def _find_checkout(start=None):
-    \"\"\"Walk up from `start` looking for a directory containing mlschool/.\"\"\"
-    d = os.path.abspath(start or os.getcwd())
-    while True:
-        if os.path.isfile(os.path.join(d, "mlschool", "__init__.py")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-
 try:
-    import mlschool                       # already installed, or already on sys.path
-except ModuleNotFoundError:
-    root = _find_checkout()               # are we sitting inside the repo already?
-    if root is None:                      # no -- fetch it (this is the Colab path)
-        if not os.path.isdir(REPO_DIR):
-            subprocess.run(["git", "clone", "--depth", "1", REPO_URL, REPO_DIR],
-                           check=True)
-        root = os.path.abspath(REPO_DIR)
-        try:                              # nice-to-have; sys.path below is enough
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", root],
-                           check=True)
-        except subprocess.CalledProcessError:
-            print("pip install failed; falling back to sys.path (usually fine)")
-    sys.path.insert(0, root)
     import mlschool
+except ModuleNotFoundError:
+    here = [os.path.abspath(d) for d in (".", "..", "../..")]
+    root = next((d for d in here
+                 if os.path.isfile(os.path.join(d, "mlschool", "__init__.py"))), None)
+    if root is None:                                   # not inside a checkout: fetch it
+        subprocess.run(["git", "clone", "--depth", "1", REPO, "{repo_dir}"], check=True)
+        root = os.path.abspath("{repo_dir}")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", root])
+    sys.path.insert(0, root)
 
 import mlschool as ms
-print("mlschool", ms.__version__, "from", os.path.dirname(ms.__file__))
-print("device:", ms.device())"""
+import time
+import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+torch.manual_seed(0); np.random.seed(0)
+DEVICE = ms.device()
+ms.hello()"""
 
 
 def _setup():

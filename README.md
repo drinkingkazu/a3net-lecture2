@@ -168,6 +168,12 @@ their own right, and they are the parts most worth reading before you teach:
   0.000) against the U-Net (track IoU 0.90, unweighted). The lesson becomes "ask
   whether your model can see the difference before you reach for a reweighting
   scheme".
+- **NB2 §3, patient D** — training-side metrics are logged **20× per epoch**
+  (they are computed every step anyway, so it is free; validation stays
+  per-epoch because it needs extra forward passes). The unshuffled run then
+  shows an unmistakable sawtooth with one tooth per class, in the loss, the
+  gradient norm and the update ratio simultaneously. At epoch resolution that
+  structure averages away into a merely "noisy" curve.
 - **NB2 §3, patient E** — the curve that looks exactly like overfitting (train
   loss down, validation loss up) is **not** overfitting. Evaluated with batch
   statistics instead of BatchNorm's running averages, the same model is already

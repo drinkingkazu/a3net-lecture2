@@ -44,20 +44,6 @@ content of each pair, how much one should influence the other.
 #%% setup
 
 #%% code
-import time
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("torch", torch.__version__, "| device:", DEVICE)
-
-#%% code
 train = ms.generate_dataset(4000, seed=0, progress=True)
 val   = ms.generate_dataset(1000, seed=1)
 Ytr, Yva = torch.tensor(train["label"]), torch.tensor(val["label"])

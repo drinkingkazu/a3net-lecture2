@@ -47,11 +47,6 @@ for these.)
 #%% setup
 
 #%% code
-import os
-
-import matplotlib
-import matplotlib.pyplot as plt
-
 slidekit = ms.slides          # the slide helpers live in the installed package
 
 print("helper loaded:", [n for n in dir(slidekit) if not n.startswith("_")])

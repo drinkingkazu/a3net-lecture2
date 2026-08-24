@@ -58,19 +58,7 @@ differently.
 
 #%% code
 import copy
-import time
 import warnings
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("torch", torch.__version__, "| device:", DEVICE)
 
 #%% md
 ## 1. A task that is actually hard
@@ -179,51 +167,15 @@ badly wrong in the high-confidence bins you actually cut on. **Always look at th
 diagram, not just the number.**
 
 #%% code
-def calibration_bins(probs, labels, n_bins=15):
-    # probs: (N, n_classes). .max(1) returns BOTH the value and its index, i.e.
-    # the confidence and the predicted class in one call.
-    conf, pred = probs.max(1)                  # (N,) confidence, (N,) prediction
-    correct = (pred == labels).float()         # (N,) 1.0 where the model was right
-    edges = torch.linspace(0, 1, n_bins + 1)
-    out = []
-    for i in range(n_bins):
-        m = (conf > edges[i]) & (conf <= edges[i + 1])
-        if m.sum() > 0:
-            out.append((float(edges[i] + edges[i + 1]) / 2, float(conf[m].mean()),
-                        float(correct[m].mean()), int(m.sum())))
-    return out
-
-
-def ece(probs, labels, n_bins=15):
-    bins = calibration_bins(probs, labels, n_bins)
-    n = len(labels)
-    return sum(cnt / n * abs(acc - cf) for _, cf, acc, cnt in bins)
-
-
-def report(tag, probs, labels):
-    conf, pred = probs.max(1)
-    acc = (pred == labels).float().mean()
-    nll = F.nll_loss(probs.clamp_min(1e-12).log(), labels)
-    print(f"{tag:<32} acc {acc:.3f}   mean conf {conf.mean():.3f}   "
-          f"gap {conf.mean() - acc:+.3f}   ECE {ece(probs, labels):.4f}   "
-          f"NLL {nll:.3f}")
-    return float(ece(probs, labels))
-
-
-def reliability_plot(ax, probs, labels, title, n_bins=15):
-    bins = calibration_bins(probs, labels, n_bins)
-    cf = [b[1] for b in bins]; acc = [b[2] for b in bins]; cnt = [b[3] for b in bins]
-    ax.plot([0, 1], [0, 1], "k--", lw=1, label="perfect")
-    ax.bar(cf, acc, width=1 / n_bins * 0.9, color="#4cc9f0",
-           edgecolor="k", lw=0.4, label="accuracy")
-    ax.plot(cf, cf, color="#f7b32b", lw=1.5, label="confidence")
-    for c, a, n in zip(cf, acc, cnt):
-        if n > 5:
-            ax.text(c, max(a, c) + 0.02, str(n), fontsize=6, ha="center", rotation=90)
-    ax.set_xlim(0, 1.05); ax.set_ylim(0, 1.12)
-    ax.set_xlabel("confidence"); ax.set_ylabel("accuracy")
-    ax.set_title(title, fontsize=9); ax.legend(fontsize=7, loc="upper left")
-
+# Binning, ECE and the reliability plot are standard bookkeeping, so they live
+# in the package: `ms.calibration_bins`, `ms.ece`, `ms.report_calibration` and
+# `ms.reliability_plot` / `ms.reliability_panel`. What matters is what they
+# measure, which the text above defines; the arithmetic is three lines each and
+# you can read it with `ms.metrics.ece??`.
+calibration_bins = ms.calibration_bins
+ece = ms.ece
+report = ms.report_calibration              # prints acc / conf / gap / ECE / NLL
+reliability_plot = ms.reliability_plot      # draws one panel onto a given axis
 
 logits_v = get_logits(base_model, Xv)
 probs_v = logits_v.softmax(1)

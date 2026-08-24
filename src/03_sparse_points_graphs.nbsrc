@@ -58,20 +58,6 @@ notebook is really about a second symmetry:
 #%% setup
 
 #%% code
-import time
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("torch", torch.__version__, "| device:", DEVICE)
-
-#%% code
 train = ms.generate_dataset(4000, seed=0, progress=True)
 val   = ms.generate_dataset(1000, seed=1)
 Ytr, Yva = torch.tensor(train["label"]), torch.tensor(val["label"])
@@ -232,61 +218,31 @@ class OrderedMLP(nn.Module):
         return self.f(p * m[..., None])
 
 
-def shuffle_points(p, m):
-    """Randomly permute the point ordering within each event."""
-    # A different permutation per event, so this is not a single global reordering.
-    perm = torch.stack([torch.randperm(p.shape[1], device=p.device)
-                        for _ in range(len(p))])                   # (B, N)
-    # The mask must be permuted with the points, or real hits would acquire
-    # padding flags and vice versa.
-    return (torch.gather(p, 1, perm[..., None].expand(-1, -1, p.shape[-1])),  # (B, N, 3)
-            torch.gather(m, 1, perm))                                          # (B, N)
+# The test itself is three lines. `train_points(..., check_shuffled=True)` runs
+# it for us on every model below; here it is once, explicitly, so you can see
+# that "relabel the points" really is just a permutation of the N axis.
+demo_p, demo_m = Ptr[:2], Mtr[:2]
+shuffled_p, shuffled_m = ms.points.shuffle_points(demo_p, demo_m)
+print("same shape :", tuple(demo_p.shape), "->", tuple(shuffled_p.shape))
+print("same hits  :", bool(torch.allclose(demo_p.sum(1), shuffled_p.sum(1), atol=1e-5)),
+      " (the SET of points is identical)")
+print("same order :", bool(torch.equal(demo_p, shuffled_p)),
+      " (the LIST is not)")
 
 
-@torch.no_grad()
-def accuracy(model, P, Mk, Y, shuffled=False, bs=128):
-    model.eval()
-    correct = 0
-    for i in range(0, len(P), bs):
-        p, m = P[i:i + bs].to(DEVICE), Mk[i:i + bs].to(DEVICE)
-        if shuffled:
-            p, m = shuffle_points(p, m)
-        correct += (model(p, m).argmax(1).cpu() == Y[i:i + bs]).sum().item()
-    return correct / len(P)
-
-
-def train_points(name, model, epochs=8, lr=2e-3, bs=64):
-    torch.manual_seed(0)
-    model = model.to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    if DEVICE == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
-    for ep in range(epochs):
-        model.train()
-        perm = torch.randperm(len(Ptr))
-        for i in range(0, len(perm), bs):
-            b = perm[i:i + bs]
-            opt.zero_grad()
-            loss = F.cross_entropy(model(Ptr[b].to(DEVICE), Mtr[b].to(DEVICE)),
-                                   Ytr[b].to(DEVICE))
-            loss.backward(); opt.step()
-    secs = time.time() - t0
-    mem = torch.cuda.max_memory_allocated() / 1e6 if DEVICE == "cuda" else float("nan")
-    res = {
-        "name": name,
-        "params": sum(p.numel() for p in model.parameters()),
-        "acc": accuracy(model, Pva, Mva, Yva),
-        "acc_shuffled": accuracy(model, Pva, Mva, Yva, shuffled=True),
-        "seconds": secs, "peak_MB": mem,
-    }
-    print(f"{name:<12} params {res['params']:>8,}   acc {res['acc']:.3f}   "
-          f"acc(shuffled) {res['acc_shuffled']:.3f}   {secs:.0f} s")
-    return res, model
+# Training a model with signature `model(points, mask)` and reporting
+# parameters / accuracy / accuracy-under-relabelling / time / memory is the same
+# five lines every time, so `ms.points.train_point_model` does it. Its
+# `check_shuffled` argument re-evaluates with the points permuted -- the test
+# this whole notebook is about.
+def train_points(name, model, **kw):
+    return ms.points.train_point_model(name, model, Ptr, Mtr, Ytr,
+                                       Pva, Mva, Yva, **kw)
 
 
 results = []
-r, _ = train_points("OrderedMLP", OrderedMLP()); results.append(r)
+r, _ = train_points("OrderedMLP", OrderedMLP())
+results.append(r)
 
 #%% md
 There it is. The naive model scores well on the ordering it was trained with —

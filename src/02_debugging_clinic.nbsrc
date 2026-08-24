@@ -54,20 +54,6 @@ clinic) is the part that matters.
 #%% setup
 
 #%% code
-import time
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("torch", torch.__version__, "| device:", DEVICE)
-
-#%% code
 train = ms.generate_dataset(3000, seed=0, progress=True)
 val   = ms.generate_dataset(1000, seed=1)
 
@@ -92,6 +78,13 @@ right thing. Log these five instead.
 | **gradient norm** $\lVert g \rVert$ | exploding (huge, spiky) or vanishing (many orders of magnitude too small) gradients |
 | **update ratio** $\lVert \Delta\theta \rVert / \lVert \theta \rVert$ | is the learning rate sane? Healthy is $\sim10^{-3}$ per step. $10^{-1}$ means you are destroying the model each step; $10^{-6}$ means nothing is happening |
 | **dead-unit fraction** | fraction of ReLU outputs that are exactly zero. Creeping towards 1 means units have died and will never recover |
+
+**Two resolutions.** The train-side quantities are computed on every step
+anyway, so we record them **twenty times per epoch**; the validation numbers
+need extra forward passes, so they stay at epoch boundaries. Both are plotted
+against epochs, so the x-axis reads the same. This matters more than it sounds:
+one of the patients below has structure *inside* each epoch that an epoch
+average erases completely.
 
 The **update ratio** deserves emphasis, because it is the single most useful
 number and almost nobody logs it. It is dimensionless and roughly
@@ -134,161 +127,23 @@ def make_net(n_blocks=4, ch=24, norm=True, residual=False, pool_every=1):
 print(make_net(n_blocks=4))
 
 #%% code
-def shift_augment(x, max_shift=12):
-    """Randomly translate each event. A cheap way to inject translation
-    invariance through the data instead of through the architecture.
-
-    torch.roll wraps content around the edges rather than padding with zeros.
-    That is harmless here because our events sit well inside the frame, and it
-    keeps the total charge in the image exactly constant.
-    """
-    out = torch.empty_like(x)
-    dx = torch.randint(-max_shift, max_shift + 1, (len(x),))
-    dy = torch.randint(-max_shift, max_shift + 1, (len(x),))
-    for i in range(len(x)):
-        out[i] = torch.roll(x[i], shifts=(int(dy[i]), int(dx[i])), dims=(1, 2))
-    return out
-
-
-@torch.no_grad()
-def dead_fraction(model, xb):
-    """Fraction of ReLU outputs that are exactly zero."""
-    # A forward hook fires every time a module produces an output. We attach one
-    # to every ReLU, run a batch through, and record what fraction of each ReLU's
-    # outputs came out as exactly zero.
-    stats = []
-    hooks = [m.register_forward_hook(lambda _m, _i, o: stats.append((o == 0).float().mean().item()))
-             for m in model.modules() if isinstance(m, nn.ReLU)]
-    model.eval(); model(xb.to(DEVICE))
-    for h in hooks:
-        h.remove()
-    return float(np.mean(stats)) if stats else 0.0
+# Everything the clinic needs is in the package: `ms.fit_instrumented` runs one
+# instrumented training run and returns the six logged series; `ms.plot_histories`
+# draws the six-panel instrument panel. Read their source with
+# `ms.training.fit_instrumented??` if you are curious -- but the *contents* of a
+# training loop are not the lesson here, the curves are.
+def experiment(name, model=None, **kw):
+    """One instrumented run on our data. `model` may be a zero-argument factory,
+    so the network is built after the seed is set and the run reproduces."""
+    raw = kw.pop("raw_inputs", False)
+    xtr = torch.tensor(train["image"])[:, None] if raw else X
+    xva = torch.tensor(val["image"])[:, None] if raw else XV
+    n = kw.pop("n_train", None) or len(xtr)
+    return ms.fit_instrumented(name, model if model is not None else make_net,
+                               xtr[:n], Y[:n], xva, YV, **kw)
 
 
-def experiment(name, model=None, lr=1e-3, epochs=6, bs=64, n_train=None,
-               optimizer="adam", weight_decay=0.0, shuffle=True, augment=False,
-               scheduler=None, raw_inputs=False, clip=None, verbose=False,
-               light=False):
-    """One training run, fully instrumented. Every knob we will need.
-
-    `model` may be a module or a zero-argument factory. Prefer the factory: the
-    network is then built AFTER the seed is set, so a run reproduces regardless
-    of what the notebook did beforehand. Passing an already-built module means
-    its initial weights depend on the ambient RNG state -- an easily-missed
-    source of irreproducibility (checklist item 15).
-
-    `light=True` skips the per-step update-ratio bookkeeping, which copies every
-    parameter twice per step, for runs where we only want the final accuracy.
-    """
-    torch.manual_seed(0)
-    if model is None:
-        model = make_net()
-    elif not isinstance(model, nn.Module):
-        model = model()
-    model = model.to(DEVICE)
-
-    xtr = (torch.tensor(train["image"])[:, None] if raw_inputs else X)
-    xva = (torch.tensor(val["image"])[:, None] if raw_inputs else XV)
-    n = n_train or len(xtr)
-    xtr, ytr = xtr[:n], Y[:n]
-
-    if optimizer == "adam":
-        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    elif optimizer == "adamw":
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    else:
-        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
-                              weight_decay=weight_decay)
-
-    steps = epochs * int(np.ceil(n / bs))
-    sched = None
-    if scheduler == "cosine":
-        sched = torch.optim.lr_scheduler.OneCycleLR(
-            opt, max_lr=lr, total_steps=steps, pct_start=0.15)
-
-    order = torch.argsort(ytr) if not shuffle else None
-    h = {k: [] for k in ["train_loss", "val_loss", "val_acc",
-                         "grad_norm", "update_ratio", "dead", "lr"]}
-    t0 = time.time()
-    for ep in range(epochs):
-        model.train()
-        perm = order if not shuffle else torch.randperm(n)
-        tot, gsum, usum, nb = 0.0, 0.0, 0.0, 0
-        for i in range(0, n, bs):
-            b = perm[i:i + bs]
-            if len(b) < 2:
-                continue
-            xb = xtr[b]
-            if augment:
-                xb = shift_augment(xb)
-            opt.zero_grad()
-            loss = F.cross_entropy(model(xb.to(DEVICE)), ytr[b].to(DEVICE))
-            loss.backward()
-            gnorm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), clip if clip else 1e12).item()
-            if light:
-                opt.step()
-            else:
-                # The update ratio: flatten EVERY parameter into one long vector,
-                # before and after the step, and compare the size of the change to
-                # the size of the weights. One dimensionless number per step, with
-                # a target you can memorise (~1e-3) regardless of architecture.
-                before = torch.cat([p.detach().flatten() for p in model.parameters()])
-                opt.step()
-                after = torch.cat([p.detach().flatten() for p in model.parameters()])
-                usum += ((after - before).norm()
-                         / before.norm().clamp(min=1e-12)).item()
-            tot += loss.item() * len(b)
-            gsum += gnorm
-            nb += 1
-            if sched:
-                sched.step()
-
-        model.eval()
-        vl, correct = 0.0, 0
-        with torch.no_grad():
-            for i in range(0, len(xva), 256):
-                o = model(xva[i:i + 256].to(DEVICE))
-                vl += F.cross_entropy(o, YV[i:i + 256].to(DEVICE)).item() * len(o)
-                correct += (o.argmax(1).cpu() == YV[i:i + 256]).sum().item()
-
-        h["train_loss"].append(tot / n)
-        h["val_loss"].append(vl / len(xva))
-        h["val_acc"].append(correct / len(xva))
-        h["grad_norm"].append(gsum / nb)
-        h["update_ratio"].append(usum / nb)
-        h["dead"].append(0.0 if light else dead_fraction(model, xtr[:64]))
-        h["lr"].append(opt.param_groups[0]["lr"])
-        if verbose:
-            print(f"  ep {ep + 1}/{epochs}  train {h['train_loss'][-1]:.4f}"
-                  f"  val {h['val_loss'][-1]:.4f}  acc {h['val_acc'][-1]:.3f}"
-                  f"  |g| {h['grad_norm'][-1]:.2e}  upd {h['update_ratio'][-1]:.1e}")
-    h["name"], h["seconds"] = name, time.time() - t0
-    print(f"{name:34s} final val acc {h['val_acc'][-1]:.3f}   ({h['seconds']:.0f} s)")
-    return h
-
-
-def plot_runs(runs, title=None, figsize=(13, 6.5)):
-    keys = [("train_loss", "training loss", True),
-            ("val_loss", "validation loss", True),
-            ("val_acc", "validation accuracy", False),
-            ("grad_norm", "gradient norm", True),
-            ("update_ratio", r"update ratio $|\Delta\theta|/|\theta|$", True),
-            ("dead", "dead-unit fraction", False)]
-    fig, axes = plt.subplots(2, 3, figsize=figsize)
-    for ax, (k, lab, logy) in zip(axes.ravel(), keys):
-        for r in runs:
-            ax.plot(range(1, len(r[k]) + 1), r[k], "o-", ms=3, label=r["name"])
-        ax.set_title(lab, fontsize=9); ax.set_xlabel("epoch")
-        if logy:
-            ax.set_yscale("log")
-        ax.grid(alpha=0.3)
-    axes[0, 2].axhline(1 / 3, ls=":", c="grey")
-    axes[1, 1].axhspan(3e-4, 3e-3, color="green", alpha=0.12)
-    axes[0, 0].legend(fontsize=7)
-    if title:
-        fig.suptitle(title, y=1.01)
-    fig.tight_layout(); plt.show()
+plot_runs = ms.plot_histories          # same six panels, same healthy-band shading
 
 #%% md
 ## 2. What healthy looks like
@@ -303,7 +158,9 @@ plot_runs([healthy], "reference: a training run that is working")
 #%% md
 Commit these shapes to memory:
 
-- **training loss** falls smoothly and keeps falling;
+- **training loss** falls and keeps falling. At twenty samples per epoch it is
+  visibly jagged -- individual batches differ, and that scatter is normal. Read
+  the trend, not the wiggle;
 - **validation loss** tracks it, a little above, and does not turn upward;
 - **gradient norm** is $O(1)$, decreasing gently, no spikes;
 - **update ratio** sits in the $10^{-3}$ band;
@@ -477,12 +334,20 @@ flourish; it is the load-bearing structure that makes depth possible at all.**
 
 ### Patient D — the data was never shuffled
 
-**Signature:** training loss oscillates violently and does not converge. Gradient
-norm is large and spiky. Validation accuracy hovers around chance and may lurch
-between values.
+**Signature:** look at the training-loss panel and *count the teeth*. The loss
+falls, jumps, falls, jumps -- with a period of exactly one third of an epoch,
+and we have exactly three classes. The gradient norm and the update ratio show
+the same rhythm. Validation accuracy sits near chance.
+
+That periodicity is the entire diagnosis, and it is only visible because we log
+twenty times per epoch. Averaged over an epoch, all three panels collapse to a
+merely "noisy" curve that could be a dozen different faults.
 
 **What is happening:** we sorted the training set by class label. Every batch now
-contains events of a single class. Stochastic gradient descent assumes each
+contains events of a single class -- which is why the period is one third of an
+epoch: the model works through all the tracks, then all the showers, then all
+the track+shower events, and the loss spikes each time the class changes under
+it. Stochastic gradient descent assumes each
 mini-batch is an unbiased sample of the training distribution; a single-class
 batch is maximally biased. The model is repeatedly told "everything is a track",
 then "everything is a shower", and it dutifully chases each in turn.

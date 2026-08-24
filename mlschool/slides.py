@@ -46,39 +46,107 @@ USE_STATIC = False
 # --------------------------------------------------------------------------
 # conversion
 # --------------------------------------------------------------------------
-def pdf_to_images(pdf_path, out_dir, dpi=110, prefix="slide"):
+def _ink_bbox(img, tol=8):
+    """Bounding box of everything that is not (near-)white."""
+    from PIL import ImageChops, Image
+    bg = Image.new("RGB", img.size, (255, 255, 255))
+    diff = ImageChops.difference(img.convert("RGB"), bg).convert("L")
+    return diff.point(lambda v: 255 if v > tol else 0).getbbox()
+
+
+def _shared_crop_box(images, margin=8, tol=8):
+    """One crop box covering the content of EVERY page.
+
+    Cropping each page to its own content would make the slides different
+    sizes, so they would jump around as you click through. Taking the union
+    keeps them identical and preserves the relative position of everything.
+    """
+    boxes = [b for b in (_ink_bbox(im, tol) for im in images) if b]
+    if not boxes:
+        return None
+    l = max(min(b[0] for b in boxes) - margin, 0)
+    t = max(min(b[1] for b in boxes) - margin, 0)
+    r = min(max(b[2] for b in boxes) + margin, images[0].width)
+    b_ = min(max(b[3] for b in boxes) + margin, images[0].height)
+    return (l, t, r, b_)
+
+
+def pdf_to_images(pdf_path, out_dir, dpi=110, prefix="slide", crop="auto",
+                  margin=8, quiet=False):
     """Render each PDF page to a PNG. Returns the sorted list of paths.
 
-    Tries PyMuPDF first (pip installable, no system dependency), then falls
-    back to poppler's `pdftoppm`. Run this once, offline; commit the PNGs next
-    to the notebook so students do not need either tool.
+    Run this once, offline; commit the PNGs so students need no PDF tooling.
+
+    **crop** — decks are often "printed" to Letter/A4 rather than exported at
+    slide size, which leaves the slide sitting in a band of white. The default
+    ``"auto"`` measures where the ink actually is, across all pages, and trims
+    every page to that single shared box. Pass ``crop=None`` to keep the pages
+    exactly as they are, or a 4-tuple of *fractions* ``(left, top, right,
+    bottom)`` to crop by hand.
+
+    Backend: PyMuPDF if importable (``pip install pymupdf``), else poppler's
+    ``pdftoppm``.
 
     PowerPoint / Keynote: export to PDF first, or
-    `libreoffice --headless --convert-to pdf deck.pptx`.
+    ``libreoffice --headless --convert-to pdf deck.pptx``.
     """
+    import io
+    from PIL import Image
+
     os.makedirs(out_dir, exist_ok=True)
+    pages = []
 
     try:
-        import fitz                                   # PyMuPDF
+        import fitz                                       # PyMuPDF
         doc = fitz.open(pdf_path)
         zoom = dpi / 72.0
-        for i, page in enumerate(doc):
+        for page in doc:
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            pix.save(os.path.join(out_dir, f"{prefix}_{i:03d}.png"))
+            pages.append(Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB"))
         doc.close()
-        return sorted(glob.glob(os.path.join(out_dir, f"{prefix}_*.png")))
     except ImportError:
-        pass
+        if not shutil.which("pdftoppm"):
+            raise RuntimeError(
+                "Need PyMuPDF or poppler to rasterise the PDF.\n"
+                "  pip install pymupdf            (no system packages needed)\n"
+                "  apt-get install poppler-utils  (provides pdftoppm)")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["pdftoppm", "-png", "-r", str(dpi), pdf_path,
+                            os.path.join(tmp, "p")], check=True)
+            for f in sorted(glob.glob(os.path.join(tmp, "p*.png"))):
+                pages.append(Image.open(f).convert("RGB"))
 
-    if shutil.which("pdftoppm"):
-        subprocess.run(["pdftoppm", "-png", "-r", str(dpi), pdf_path,
-                        os.path.join(out_dir, prefix)], check=True)
-        return sorted(glob.glob(os.path.join(out_dir, f"{prefix}-*.png")))
+    if not pages:
+        raise RuntimeError(f"no pages rendered from {pdf_path!r}")
 
-    raise RuntimeError(
-        "Need PyMuPDF or poppler to rasterise the PDF.\n"
-        "  pip install pymupdf          (no system packages needed)\n"
-        "  apt-get install poppler-utils  (provides pdftoppm)")
+    box = None
+    if crop == "auto":
+        box = _shared_crop_box(pages, margin=margin)
+    elif crop:                                            # fractions
+        w, h = pages[0].size
+        l, t, r, b = crop
+        box = (int(l * w), int(t * h), int(r * w), int(b * h))
+
+    if box:
+        before = pages[0].size
+        pages = [im.crop(box) for im in pages]
+        after = pages[0].size
+        if not quiet and after != before:
+            saved = 100 * (1 - (after[0] * after[1]) / (before[0] * before[1]))
+            print(f"cropped {before[0]}x{before[1]} -> {after[0]}x{after[1]} "
+                  f"(removed {saved:.0f}% whitespace, same box on every page)")
+
+    paths = []
+    for i, im in enumerate(pages):
+        path = os.path.join(out_dir, f"{prefix}_{i:03d}.png")
+        im.save(path)
+        paths.append(path)
+    if not quiet:
+        print(f"wrote {len(paths)} slides to {out_dir} "
+              f"({pages[0].width}x{pages[0].height}, "
+              f"aspect {pages[0].width / pages[0].height:.2f})")
+    return paths
 
 
 def _css_width(width):

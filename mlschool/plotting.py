@@ -13,6 +13,23 @@ from .data import CLASS_NAMES, SEG_COLORS, SEG_NAMES, SIZE
 BG = "#101418"
 
 
+def _finish(fig, show=True):
+    """Display the figure and return nothing, or hand it back for editing.
+
+    Why this matters: if a function RETURNS a Figure and you call it as the last
+    expression in a cell, Jupyter renders it a second time -- once from the
+    inline backend, once from the display hook -- and you get two identical
+    panels. So the default is to show and return None. Pass `show=False` when
+    you want the object, e.g. to `fig.savefig(...)`.
+    """
+    import matplotlib.pyplot as plt
+    if show:
+        plt.show()
+        return None
+    plt.close(fig)          # keep the inline backend from showing it anyway
+    return fig
+
+
 # --------------------------------------------------------------------------
 # events
 # --------------------------------------------------------------------------
@@ -37,7 +54,7 @@ def plot_event(ds, i, ax=None, mode="charge", title=None):
     return ax
 
 
-def plot_grid(ds, idx=None, n=6, titles=None):
+def plot_grid(ds, idx=None, n=6, titles=None, show=True):
     """A row of events: charge on top, per-pixel semantics below."""
     import matplotlib.pyplot as plt
     idx = list(range(n)) if idx is None else list(idx)
@@ -50,14 +67,14 @@ def plot_grid(ds, idx=None, n=6, titles=None):
     axes[0, 0].set_ylabel("charge", fontsize=9)
     axes[1, 0].set_ylabel("semantics", fontsize=9)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def plot_class_examples(ds, names=CLASS_NAMES, per_class=2):
+def plot_class_examples(ds, names=CLASS_NAMES, per_class=2, show=True):
     """Two examples of each class, charge and semantics."""
     idx = [int(np.where(ds["label"] == c)[0][k])
            for c in range(len(names)) for k in range(per_class)]
-    return plot_grid(ds, idx)
+    return plot_grid(ds, idx, show=show)
 
 
 def plot_points(coords, values, ax=None, discrete=False, title="", size=6):
@@ -75,7 +92,7 @@ def plot_points(coords, values, ax=None, discrete=False, title="", size=6):
     return ax
 
 
-def plot_segmentation_comparison(ds, preds, idx, row_labels):
+def plot_segmentation_comparison(ds, preds, idx, row_labels, show=True):
     """Input charge, truth, and one row per model prediction."""
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
@@ -93,27 +110,47 @@ def plot_segmentation_comparison(ds, preds, idx, row_labels):
     for r, name in enumerate(["input charge", "truth"] + list(row_labels)):
         axes[r, 0].set_ylabel(name, fontsize=9)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # training diagnostics
 # --------------------------------------------------------------------------
-PANELS = [("train_loss", "training loss", True),
-          ("val_loss", "validation loss", True),
-          ("val_acc", "validation accuracy", False),
-          ("grad_norm", "gradient norm", True),
-          ("update_ratio", r"update ratio  $|\Delta\theta|/|\theta|$", True),
-          ("dead", "dead-unit fraction", False)]
+# (key, label, log-y, resolution). "fine" series are logged many times per
+# epoch; "epoch" series once per epoch. Both are plotted against epochs.
+PANELS = [("train_loss", "training loss", True, "fine"),
+          ("val_loss", "validation loss", True, "epoch"),
+          ("val_acc", "validation accuracy", False, "epoch"),
+          ("grad_norm", "gradient norm", True, "fine"),
+          ("update_ratio", r"update ratio  $|\Delta\theta|/|\theta|$", True, "fine"),
+          ("dead", "dead-unit fraction", False, "epoch")]
 
 
-def plot_histories(runs, title=None, figsize=(13, 6.5)):
-    """The six-panel instrument panel, one line per run."""
+def _series_x(run, key, res):
+    """x-coordinates in epochs, tolerating histories logged only per epoch."""
+    axis = "step_epoch" if res == "fine" else "epoch"
+    if axis in run and len(run[axis]) == len(run[key]):
+        return run[axis]
+    return list(range(1, len(run[key]) + 1))        # older per-epoch history
+
+
+def plot_histories(runs, title=None, figsize=(13, 6.5), show=True):
+    """The six-panel instrument panel, one line per run.
+
+    Train-side panels are drawn as thin lines because they carry many points
+    per epoch; per-epoch panels keep their markers.
+    """
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(2, 3, figsize=figsize)
-    for ax, (key, label, logy) in zip(axes.ravel(), PANELS):
+    for ax, (key, label, logy, res) in zip(axes.ravel(), PANELS):
         for r in runs:
-            ax.plot(range(1, len(r[key]) + 1), r[key], "o-", ms=3, label=r["name"])
+            if key not in r or not len(r[key]):
+                continue
+            x = _series_x(r, key, res)
+            if res == "fine":
+                ax.plot(x, r[key], lw=1.1, alpha=0.9, label=r["name"])
+            else:
+                ax.plot(x, r[key], "o-", ms=3.5, label=r["name"])
         ax.set_title(label, fontsize=9); ax.set_xlabel("epoch")
         if logy:
             ax.set_yscale("log")
@@ -125,10 +162,11 @@ def plot_histories(runs, title=None, figsize=(13, 6.5)):
     if title:
         fig.suptitle(title, y=1.01)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def plot_layer_gradients(series, title="why deep plain networks do not train"):
+def plot_layer_gradients(series, title="why deep plain networks do not train",
+                         show=True):
     """Gradient norm per layer at initialisation. series = {label: [norms]}."""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(7.5, 4))
@@ -138,10 +176,10 @@ def plot_layer_gradients(series, title="why deep plain networks do not train"):
     ax.set_ylabel("gradient norm at initialisation")
     ax.set_title(title, fontsize=10)
     ax.legend(); ax.grid(alpha=0.3, which="both")
-    return fig
+    return _finish(fig, show)
 
 
-def plot_lr_finder(lrs, losses, smooth_window=7):
+def plot_lr_finder(lrs, losses, smooth_window=7, show=True):
     """The LR range test, with a suggested value."""
     import matplotlib.pyplot as plt
     smooth = np.convolve(losses, np.ones(smooth_window) / smooth_window, mode="same")
@@ -156,7 +194,8 @@ def plot_lr_finder(lrs, losses, smooth_window=7):
     ax.set_xlabel("learning rate"); ax.set_ylabel("batch loss")
     ax.set_title("LR range test: one epoch, and you never guess again", fontsize=10)
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
-    return fig, lrs[best] / 10
+    _finish(fig, show)
+    return lrs[best] / 10          # the suggested learning rate
 
 
 # --------------------------------------------------------------------------
@@ -180,7 +219,7 @@ def reliability_plot(ax, probs, labels, title, n_bins=15):
     return ax
 
 
-def reliability_panel(items, n_bins=15):
+def reliability_panel(items, n_bins=15, show=True):
     """items = [(probs, labels, title), ...] side by side."""
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, len(items), figsize=(4.4 * len(items), 4.1))
@@ -188,10 +227,10 @@ def reliability_panel(items, n_bins=15):
     for ax, (p, y, t) in zip(axes, items):
         reliability_plot(ax, p, y, t, n_bins)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def plot_pull(pulls, titles):
+def plot_pull(pulls, titles, show=True):
     """Pull histograms against a unit Gaussian. pulls = list of 1-D arrays."""
     import matplotlib.pyplot as plt
     grid = np.linspace(-5, 5, 200)
@@ -208,4 +247,4 @@ def plot_pull(pulls, titles):
         ax.set_xlabel(r"$(y_{\rm true} - \mu)\,/\,\sigma$")
         ax.legend(fontsize=8)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)

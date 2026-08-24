@@ -20,6 +20,17 @@ GREY = "#9aa5b1"
 PALE = "#dfe6ec"
 
 
+def _finish(fig, show=True):
+    """Show and return None (default), or return the Figure. See
+    mlschool.plotting._finish for why returning a Figure double-renders."""
+    import matplotlib.pyplot as plt
+    if show:
+        plt.show()
+        return None
+    plt.close(fig)          # keep the inline backend from showing it anyway
+    return fig
+
+
 def _canvas(w=10, h=4, xlim=(0, 10), ylim=(0, 4), n=1):
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, n, figsize=(w, h))
@@ -59,7 +70,7 @@ def _grid(ax, x0, y0, n, cell, active=None, face=PALE, on=BLUE, lw=0.5):
 # --------------------------------------------------------------------------
 # NB0
 # --------------------------------------------------------------------------
-def weight_sharing():
+def weight_sharing(show=True):
     """MLP connects everything to everything; a CNN reuses one small kernel."""
     fig, axes = _canvas(11, 4.6, (0, 10), (0, 9), n=2)
 
@@ -101,10 +112,10 @@ def weight_sharing():
     ax.text(5.0, 4.2, "same\nkernel", ha="center", va="center", fontsize=8,
             color=BLUE, style="italic")
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def representations():
+def representations(show=True):
     """The same sparse event held three different ways."""
     fig, axes = _canvas(12, 4.2, (0, 10), (0, 10), n=3)
     hits = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (6, 7)]
@@ -137,14 +148,15 @@ def representations():
     ax.text(5.0, 0.15, "same 18 numbers,\nplus edges you choose",
             ha="center", fontsize=8.5, color=INK)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # NB1
 # --------------------------------------------------------------------------
 def receptive_field(layers=(("conv 3x3", 3), ("conv 3x3", 5), ("pool /2", 6),
-                            ("conv 3x3", 10), ("conv 3x3", 14), ("pool /2", 16))):
+                            ("conv 3x3", 10), ("conv 3x3", 14), ("pool /2", 16)),
+                    show=True):
     """How far back into the input one deep unit can see."""
     from matplotlib.patches import Rectangle
     n_in = 21
@@ -177,10 +189,10 @@ def receptive_field(layers=(("conv 3x3", 3), ("conv 3x3", 5), ("pool /2", 6),
     ax.set_title("receptive field: convolutions widen it slowly, "
                  "pooling widens it fast", fontsize=10, pad=14)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def encoder_heads():
+def encoder_heads(show=True):
     """One shared encoder, a decoder for per-pixel output, three task heads."""
     fig, ax = _canvas(12, 5.9, (0, 24), (-0.6, 11.6), n=1)
     enc = [("1x96x96", 0.5, 8.6, BLUE), ("16x48x48", 2.9, 7.2, BLUE),
@@ -219,10 +231,10 @@ def encoder_heads():
     ax.text(12.0, -0.35, "three heads; each pooling chosen to match the physics "
                          "of its target", ha="center", fontsize=8.5, style="italic")
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def skip_connection_types():
+def skip_connection_types(show=True):
     """Two unrelated mechanisms share the name 'skip connection'."""
     fig, axes = _canvas(11, 3.9, (0, 12), (0, 7), n=2)
 
@@ -259,13 +271,13 @@ def skip_connection_types():
             fontsize=8.5, style="italic", color=INK)
     ax.set_title("U-Net skip  —  concatenation across resolutions", fontsize=10)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # NB2
 # --------------------------------------------------------------------------
-def gradient_flow():
+def gradient_flow(show=True):
     """Why depth needs residual connections and normalisation."""
     fig, axes = _canvas(10.5, 4.6, (0, 10), (0, 12), n=2)
     n = 7
@@ -294,10 +306,10 @@ def gradient_flow():
         ax.set_title("plain deep network" if not residual else
                      "+ residual connections & normalisation", fontsize=10)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def diagnosis_tree():
+def diagnosis_tree(show=True):
     """The decision procedure for a model that will not train."""
     fig, ax = _canvas(12, 5.4, (0, 24), (0, 11), n=1)
     _box(ax, 8.6, 9.2, 6.8, 1.3, INK, "training loss is not falling", fs=9)
@@ -323,13 +335,13 @@ def diagnosis_tree():
                        "see the evidence?", ha="center", fontsize=8.5, style="italic")
     ax.set_title("triage: the training loss is flat", fontsize=10)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # NB3
 # --------------------------------------------------------------------------
-def batching_strategies():
+def batching_strategies(show=True):
     """Two ways to put variable-length events into one tensor."""
     fig, axes = _canvas(11.5, 4.4, (0, 16), (0, 9), n=2)
     sizes = [6, 3, 8, 4]
@@ -369,10 +381,10 @@ def batching_strategies():
                       "over the index", ha="center", fontsize=8.5, color="#1f9d6a")
     ax.set_title("B. concatenate + batch index", fontsize=10)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def message_passing():
+def message_passing(show=True):
     """Fixed geometric neighbours vs. learned, content-dependent ones."""
     fig, axes = _canvas(11.5, 4.3, (0, 10), (0, 10), n=3)
     rng = np.random.default_rng(3)
@@ -410,13 +422,13 @@ def message_passing():
     ax.scatter(*pts[i], s=130, c=AMBER, edgecolors=INK, zorder=4)
     ax.set_title("3. attention\nall pairs, learned weights", fontsize=9.5)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # NB4
 # --------------------------------------------------------------------------
-def transfer_strategies():
+def transfer_strategies(show=True):
     """Three ways to use a pretrained encoder on a small labelled sample."""
     fig, axes = _canvas(11.5, 3.9, (0, 12), (0, 7), n=3)
     specs = [("from scratch", RED, RED, "random", "random", "needs many labels"),
@@ -433,13 +445,13 @@ def transfer_strategies():
         ax.text(6.0, 1.5, note, ha="center", fontsize=8.5, style="italic")
         ax.set_title(title, fontsize=10)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # NB6
 # --------------------------------------------------------------------------
-def submanifold_convolution():
+def submanifold_convolution(show=True):
     """Standard sparse convolution dilates the active set; submanifold does not."""
     fig, axes = _canvas(11.5, 4.3, (0, 9), (0, 10), n=3)
     n, cell = 9, 0.9
@@ -465,13 +477,13 @@ def submanifold_convolution():
     axes[2].text(4.35, 9.6, "sparsity preserved exactly", ha="center", fontsize=8.5,
                  color="#1f9d6a", style="italic")
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 # --------------------------------------------------------------------------
 # NB7
 # --------------------------------------------------------------------------
-def calibration_concept():
+def calibration_concept(show=True):
     """What a reliability diagram is telling you."""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(5.2, 4.6))
@@ -490,10 +502,10 @@ def calibration_concept():
     ax.set_title("reliability: does 0.9 mean 0.9?", fontsize=10)
     ax.legend(fontsize=8, loc="upper left"); ax.grid(alpha=0.3)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
-def uncertainty_types():
+def uncertainty_types(show=True):
     """Aleatoric noise you cannot reduce vs epistemic ignorance you can."""
     import matplotlib.pyplot as plt
     rng = np.random.default_rng(0)
@@ -518,7 +530,7 @@ def uncertainty_types():
                  fontsize=10)
     ax.legend(fontsize=8, loc="lower left"); ax.grid(alpha=0.25)
     fig.tight_layout()
-    return fig
+    return _finish(fig, show)
 
 
 ALL = [weight_sharing, representations, receptive_field, encoder_heads,

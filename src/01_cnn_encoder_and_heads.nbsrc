@@ -44,20 +44,6 @@ Along the way, the two places where physics data breaks the textbook recipe:
 #%% setup
 
 #%% code
-import time
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("torch", torch.__version__, "| device:", DEVICE)
-
-#%% code
 train = ms.generate_dataset(4000, seed=0, progress=True)
 val   = ms.generate_dataset(1000, seed=1)
 ms.summarize(train, "train")
@@ -410,25 +396,10 @@ thing in this notebook. So we run the comparison twice: once with a model that i
 structurally incapable of seeing context, and once with the full U-Net.
 
 #%% code
-def seg_metrics(pred, target, n_classes=3):
-    """Per-class IoU, recall and precision."""
-    out = {}
-    for c in range(n_classes):
-        p, t = (pred == c), (target == c)
-        inter = (p & t).sum().item()
-        out[ms.SEG_NAMES[c]] = {
-            "IoU":       inter / max((p | t).sum().item(), 1),
-            "recall":    inter / max(t.sum().item(), 1),
-            "precision": inter / max(p.sum().item(), 1),
-        }
-    return out
-
-
-def show_metrics(m, title):
-    print(f"\n{title}")
-    print(f"  {'class':<12}{'IoU':>8}{'recall':>10}{'precision':>12}")
-    for name, d in m.items():
-        print(f"  {name:<12}{d['IoU']:>8.3f}{d['recall']:>10.3f}{d['precision']:>12.3f}")
+# Per-class IoU / recall / precision, and a printer for them. Standard
+# bookkeeping -- see `ms.metrics.seg_metrics??` if you want the three lines.
+seg_metrics = ms.seg_metrics
+show_metrics = ms.show_metrics
 
 #%% md
 ## 6. Experiment 1 — imbalance with a blind model
