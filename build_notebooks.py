@@ -23,6 +23,7 @@ Source format (`src/NAME.nbsrc`), markers must start at column 0:
 Usage:  python build_notebooks.py [name ...]
 """
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -85,8 +86,17 @@ DEVICE = ms.device()
 ms.hello()"""
 
 
-def _setup():
-    return _cell("code", SETUP_CELL.format(repo_url=REPO_URL, repo_dir=REPO_DIR))
+def _setup(extra=""):
+    """The clone-and-install cell, plus anything written under the marker.
+
+    Lines following `#%% setup` are appended to the same cell. That is how a
+    notebook keeps e.g. its slide-deck call fused with setup while REPO_URL
+    stays templated in exactly one place.
+    """
+    src = SETUP_CELL.format(repo_url=REPO_URL, repo_dir=REPO_DIR)
+    if extra.strip():
+        src = src.rstrip("\n") + "\n\n" + extra.strip() + "\n"
+    return _cell("code", src)
 
 
 def _inject(module_name):
@@ -118,8 +128,11 @@ def parse(path):
     cells, kind, buf = [], None, []
 
     def flush():
-        if kind is not None and "".join(buf).strip():
-            cells.append(_cell(kind, "".join(buf)))
+        body = "".join(buf)
+        if kind == "setup":
+            cells.append(_setup(body))            # body is appended to the cell
+        elif kind is not None and body.strip():
+            cells.append(_cell(kind, body))
 
     for raw in path.read_text().split("\n"):
         if raw.startswith("#%%"):
@@ -127,8 +140,7 @@ def parse(path):
             tag = raw[3:].strip()
             buf = []
             if tag == "setup":
-                cells.append(_setup())
-                kind = None
+                kind = "setup"                    # emitted by the next flush()
             elif tag.startswith("inject"):
                 cells.append(_inject(tag.split()[1]))
                 kind = None
@@ -145,14 +157,51 @@ def parse(path):
     return cells
 
 
-def build(path, out_dir):
+def digest(cells):
+    """Whitespace-insensitive fingerprint of a notebook's cells."""
+    body = "\n\x00".join(f"{c['cell_type']}:{''.join(c['source']).strip()}"
+                         for c in cells if "".join(c["source"]).strip())
+    return hashlib.sha1(body.encode()).hexdigest()
+
+
+def hand_edited(dst):
+    """True if the notebook has been edited since the build that wrote it.
+
+    Each build stamps the digest of what it wrote into the notebook metadata.
+    If the file's current digest still matches that stamp, nobody has touched
+    it and it is safe to overwrite; if it differs, the difference is somebody's
+    hand edit and rebuilding would throw it away.
+
+    An unstamped notebook predates this scheme, so we cannot tell -- treat it
+    as edited and make the caller decide.
+    """
+    try:
+        nb = json.loads(dst.read_text())
+    except Exception:
+        return False                              # unreadable -> just rebuild
+    stamp = nb.get("metadata", {}).get("mlschool_build")
+    return stamp != digest(nb["cells"])
+
+
+def build(path, out_dir, force=False):
     cells = parse(path)
     for i, c in enumerate(cells):
         c["id"] = f"cell{i:03d}"          # required by nbformat >= 4.5
-    nb = {"cells": cells, "metadata": KERNEL,
+    nb = {"cells": cells, "metadata": dict(KERNEL, mlschool_build=digest(cells)),
           "nbformat": 4, "nbformat_minor": 5}
     out_dir.mkdir(parents=True, exist_ok=True)
     dst = out_dir / (path.stem + ".ipynb")
+
+    # Refuse to clobber hand edits. The notebook is a build artefact, but it is
+    # also the thing you actually open in Jupyter -- so if it has been touched
+    # since the build that wrote it, rebuilding would silently discard that
+    # work. Sync the other way first (`sync_from_notebooks.py`, src <- notebook).
+    if dst.exists() and not force and hand_edited(dst):
+        print(f"  SKIPPED {dst.relative_to(ROOT)} -- edited since it was built; "
+              f"run `python sync_from_notebooks.py {path.stem[:2]}` first, "
+              f"or rebuild with --force to discard those edits")
+        return False
+
     dst.write_text(json.dumps(nb, indent=1) + "\n")
     n_md = sum(c["cell_type"] == "markdown" for c in nb["cells"])
     n_code = len(nb["cells"]) - n_md
@@ -160,7 +209,8 @@ def build(path, out_dir):
 
 
 if __name__ == "__main__":
-    wanted = sys.argv[1:]
+    force = "--force" in sys.argv
+    wanted = [a for a in sys.argv[1:] if not a.startswith("--")]
     # (source directory, output directory) pairs
     trees = [(SRC, OUT), (SRC / "solutions", OUT / "solutions")]
     files = [(f, out) for src, out in trees for f in sorted(src.glob("*.nbsrc"))]
@@ -169,5 +219,6 @@ if __name__ == "__main__":
     if not files:
         sys.exit("no matching .nbsrc files")
     print("building:")
-    for f, out in files:
-        build(f, out)
+    skipped = sum(build(f, out, force) is False for f, out in files)
+    if skipped:
+        print(f"\n{skipped} notebook(s) skipped to protect hand edits.")

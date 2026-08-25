@@ -282,10 +282,16 @@ def lr_finder(model, X, Y, lr_min=1e-7, lr_max=10.0, n_steps=120, bs=64,
 
 
 def layer_gradients(model, X, Y, bs=64, dev=None, ndim=4):
-    """Gradient norm of every conv weight from one batch at initialisation."""
+    """Gradient norm of every conv weight, from one batch.
+
+    Works on a freshly-built network or a trained one. Existing gradients are
+    cleared first: a trained model still holds the last step's .grad, which
+    would otherwise be added to what we measure.
+    """
     import torch.nn.functional as F
     dev = dev or device()
     model = model.to(dev)
+    model.zero_grad(set_to_none=True)
     model.train()
     F.cross_entropy(model(X[:bs].to(dev)), Y[:bs].to(dev)).backward()
     return [float(p.grad.norm()) for p in model.parameters()

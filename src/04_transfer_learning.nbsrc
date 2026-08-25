@@ -3,27 +3,24 @@
 
 **ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/drinkingkazu/a3net-lecture2/blob/main/notebooks/04_transfer_learning.ipynb)
 ---
 
 ### Where we are
 
 Every model in this lecture has been trained from random initialisation on
-thousands of perfectly labelled events. That is a luxury of simulation. Your
+thousands of perfectly labelled events. That is a luxury of simulation. Our
 actual situation will look like this:
 
-- **Simulation is abundant and perfectly labelled.** You can generate as much as
-  your CPU budget allows, and you know the truth for every pixel.
-- **Real data is abundant and unlabelled.** Nobody tells you which hits belong to
-  the shower.
-- **Labelled real data is scarce and expensive.** Hand-scanning, control samples,
-  test-beam runs — hundreds of events, not hundreds of thousands.
-- **And simulation is not data.** Your detector has noise your simulation does
-  not model, calibration that drifted, and physics your generator approximates.
+- **Simulation is abundant and perfectly labelled.**
+    - You can generate as much as your CPU budget allows, and we know the truth for every pixel.
+- **Real data is abundant and unlabelled.** 
+- **Labelled real data is scarce and expensive.**
+    - Hand-scanning, control samples, test-beam runs.
+- **And simulation is not data.**
+    - Our detector has noise the simulation does not model, calibration that drifted, and physics our generator approximates.
 
-The last point is the one that ruins careers, so we will measure it first. A
-model trained on simulation and deployed on data can fail badly, and it will not
-warn you: its validation accuracy — computed on simulation — stays beautiful.
-
+The last point is the most critical, so we will measure it first. 
 This notebook works through the remedies **in order of cost**, which is the order
 you should try them in:
 
@@ -40,7 +37,6 @@ you should try them in:
 ## 0. Setup
 
 #%% setup
-
 #%% code
 import copy
 

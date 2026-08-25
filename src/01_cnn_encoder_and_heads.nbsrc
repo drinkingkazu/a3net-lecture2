@@ -3,29 +3,27 @@
 
 **ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/drinkingkazu/a3net-lecture2/blob/main/notebooks/01_cnn_encoder_and_heads.ipynb)
 ---
 
-### Where we are
+## Set up
+
+#%% setup
+import mlschool as ms
+deck = ms.slides.SlideDeck("slides/NB1/cnn")
+deck.show(start=0)
+
+#%% md
+
+## Where we are
 
 Notebook 0 argued that an architecture is a **prior on the structure of your
-data**, and showed the payoff: a CNN with 150× fewer parameters than an MLP
-generalised to a part of the detector it had never seen.
+data**, and showed the payoff. That was the *why*. This notebook is the *how*. Two questions:
 
-That was the *why*. This notebook is the *how*. Two questions:
+**1. Receptive field**: A convolution is local (e.g., 3x3) by construction. Yet a deep CNN can find spatially larger features. We analyze how the receptive field of a CNN is formed.
 
-**1. What does a CNN actually see?** A convolution is local by construction — a
-$3\times3$ kernel looks at nine pixels. Yet a deep CNN can classify an event
-whose signature spans fifty pixels. Where does the reach come from? The answer
-is the **receptive field**, and if you learn one piece of arithmetic today, it
-should be this one: it tells you how deep your network has to be before it can
-possibly solve your problem.
-
-**2. How do you get three different answers out of one network?** In physics you
-rarely want a single label per event. You want to know *what* happened
-(classification), *where* it happened (segmentation), and *how much energy* was
-deposited (regression) — from the same detector image. The standard answer is a
-shared **encoder** plus small task-specific **heads**, and it works because the
-useful features are largely the same for all three tasks.
+**2. Multi-task cascade**: In physics we rarely want a single label per event. 
+For insstance, we want to know *what* happened (classification), *where* it happened (segmentation), and *how much energy* was deposited (regression) — from the same detector image. The standard answer is a shared **encoder** plus small task-specific **heads**.
 
 Along the way, the two places where physics data breaks the textbook recipe:
 
@@ -37,11 +35,6 @@ Along the way, the two places where physics data breaks the textbook recipe:
   badly-simulated event can dominate the gradient of an entire batch.
 
 **Runtime:** roughly 8–12 minutes on a Colab T4.
-
-#%% md
-## 0. Setup
-
-#%% setup
 
 #%% code
 train = ms.generate_dataset(4000, seed=0, progress=True)
@@ -91,19 +84,10 @@ print(f"\nfinal receptive field: {final_rf} px, on a {ms.SIZE} px image")
 Read the table carefully, because it contains the two facts that govern CNN
 design.
 
-**Convolutions grow the receptive field slowly; pooling grows it fast.** Each
-$3\times3$ convolution adds $2j$ pixels. That is +2 at full resolution, but +16
-once the jump has reached 8. Downsampling is not primarily a way to save
-compute — it is *the* mechanism by which a CNN acquires long-range context.
-
 **Depth is not a free hyperparameter.** Our track-vs-kink task in Notebook 0
 needed the network to see a bend, which spans ~15 px; two blocks give a 16 px
 receptive field, which is just enough — and that is why a 16 k-parameter network
-solved it completely. A task that needs
-to relate a shower to a track 60 px away *cannot be solved* by a network whose
-receptive field is 30 px, no matter how long you train it or how much data you
-have. Before you debug a stubborn model, check whether it can physically see the
-evidence.
+solved it completely. A task that needs to relate a shower to a track 60 px away may make a network struggle. 
 
 > **Do this for your own problem.** Write down the physical scale of the feature
 > that distinguishes your classes, in pixels. Then make sure your receptive field
@@ -379,19 +363,17 @@ print(f"\ninverse-frequency class weights: "
       f"{', '.join(f'{ms.SEG_NAMES[c]}={class_weights[c]:.1f}' for c in range(3))}")
 
 #%% md
-**Accuracy is the wrong metric**, and that conclusion is not negotiable. We will
-report per-class **recall** (of the true track pixels, how many did we find?),
-**precision** (of the pixels we called track, how many really were?), and **IoU**
-— intersection-over-union, the standard segmentation metric precisely because it
-cannot be inflated by a large true-negative population.
+**Accuracy is the wrong metric**. We will report per-class **recall** (of the true track pixels, how many did we find?), **precision** (of the pixels we called track, how many really were?), and intersection-over-union (**IoU**), the standard segmentation metric precisely because it cannot be inflated by a large true-negative population.
 
+
+### Class imbalance?
 The received wisdom about the *loss* goes like this: unweighted cross-entropy
 averages over pixels, so 98 % of the gradient comes from background; the cheapest
 way to lower the loss early is to predict background everywhere; therefore weight
 each class by the inverse of its frequency.
 
 That argument is plausible and it is often right. **We are going to test it, and
-on this dataset it is wrong** — for a reason that turns out to be the most useful
+on this dataset it is wrong**(!) for a reason that turns out to be the most useful
 thing in this notebook. So we run the comparison twice: once with a model that is
 structurally incapable of seeing context, and once with the full U-Net.
 
@@ -406,9 +388,7 @@ show_metrics = ms.show_metrics
 
 First, a model that *cannot* use context: a stack of $1\times1$ convolutions. It
 has a receptive field of exactly one pixel, so it must decide "background, track,
-or shower" from that pixel's charge alone. Physically it is a threshold cut with
-a learned shape — the sort of thing you would write by hand before you ever
-reached for a neural network.
+or shower" from that pixel's charge alone. 
 
 Noise hits carry charge in the range 1–6; the diffuse outskirts of a shower
 overlap with that range. So for this model the classes genuinely are confusable.
@@ -576,43 +556,36 @@ show_metrics(res_b["seg"], "RUN B — inverse-frequency weighted")
 
 Weighting costs about 0.1 of IoU on both signal classes. Recall goes up — of
 course it does, we told the optimiser that missing a track is ~200 times more
-expensive than inventing one, and it believed us — but precision falls further
+expensive than inventing one, and it believed us... but precision falls further
 than recall rises. The model now scatters track labels over pixels that are not
 tracks.
 
 Glance at the **energy MAE** in both runs as well. The energy head was not
 touched, but it shares an encoder with a segmentation loss whose scale we just
 multiplied by a large factor, so it is entirely possible for it to move. When it
-does, that is **multi-task interference** — one task's gradient dragging the
-shared features away from what another task needs — and it is what "your
-$\lambda$ are real hyperparameters" means in practice. It is also run-to-run
-noisy, which is itself worth internalising: a single training run is one sample,
-not a measurement.
+does, that is **multi-task interference**. 
 
 ### What to actually take away
 
 > **Class imbalance is not, by itself, the problem. Confusability is.**
 >
 > Imbalance is fatal when your model cannot separate the classes on the evidence
-> available to it — then the prior dominates and the rare class disappears
+> available to it. Then the prior dominates and the rare class disappears
 > (Experiment 1). When the model *can* separate them, a 98:2 ratio costs nothing
 > (Experiment 2).
 >
 > So when a rare class vanishes, the first question is not "which reweighting
 > scheme?" It is **"can my model see the difference at all?"** Reweighting treats
 > the symptom. A larger receptive field, a better representation, or a more
-> informative input treats the cause — and in Experiment 1 no amount of
+> informative input treats the cause. In Experiment 1 no amount of
 > reweighting would have produced a good model, because the information simply
 > was not there.
 
 None of which means reweighting is useless. It means it is a **choice of
-operating point**, not a correction of a defect, and the right operating point
-comes from the physics downstream:
+operating point**, and the right operating point comes from the physics downstream:
 
-- reconstructing a track trajectory? Precision matters — spurious pixels drag
-  your fit.
-- searching for a rare decay you must not miss? Recall matters, and you will
-  clean up later.
+- reconstructing a track trajectory? Precision matters.
+- searching for a rare decay you must not miss? Recall matters.
 
 Two refinements worth knowing when you do need them:
 
@@ -621,11 +594,6 @@ Two refinements worth knowing when you do need them:
   every pixel of a rare class.
 - **Dice / IoU loss** optimises region overlap directly instead of optimising a
   per-pixel proxy and hoping it correlates.
-
-And the meta-lesson, which is the one that will save you the most time:
-**a plausible argument from a textbook is a hypothesis about your data, not a
-fact about it.** It took us two short training runs to find out that the standard
-advice was backwards here. Run the ablation.
 
 #%% code
 idx = [3, 11, 19, 27]
@@ -647,13 +615,11 @@ fig.tight_layout(); plt.show()
 ## 8. The loss is part of the optimisation problem
 
 The energy head has been trained with a **Huber** loss rather than the obvious
-mean squared error. That deserves an explanation, because it is the clearest
-example of a point that generalises far beyond regression:
+mean squared error. That deserves an explanation:
 
-> A loss function is not a scoreboard you consult at the end. It is the surface
-> that gradient descent has to walk across. Two losses with the same minimum can
-> have completely different landscapes away from it — and away from it is where
-> your model spends the whole of training.
+> A loss function is not a scoreboard. It is the surface  that gradient descent
+> has to walk across. Two losses with the same minimum can  have completely
+> different landscapes away from it.
 
 Compare the gradients.
 
@@ -682,7 +648,9 @@ The left panel is the one people look at. The right panel is the one that
 matters.
 
 **The MSE gradient is unbounded and grows linearly with the residual.** Early in
-training every residual is large, so the gradient is large — that is often fine.
+training every residual is large, so the gradient is large. This is not always a
+problem, and in fact it is often fine.
+
 The problem is what happens to a *single* pathological example. An event with a
 mis-simulated energy, a detector artefact, or a mislabelled truth value produces
 a residual of 10 and therefore contributes 100× the gradient of a well-fit
@@ -695,7 +663,7 @@ influence the fit; they can no longer hijack it.
 
 This is exactly the reasoning behind robust estimators in a fitting problem, and
 it is the same reasoning that motivates **gradient clipping**, which we meet in
-Notebook 2 — clipping is what you do when you cannot change the loss.
+Notebook 2. Clipping is what you do when you cannot change the loss.
 
 Let us contaminate the labels and watch it happen.
 
@@ -763,28 +731,14 @@ plt.show()
 
 #%% md
 Both models see identical data. The only difference is the shape of the loss far
-from the optimum, and it is worth a substantial factor in validation error —
-often with visibly noisier convergence for MSE, because individual bad events
-keep yanking the parameters.
-
-Two percent contamination is not pessimistic. It is roughly what you get from a
-simulation bug you have not found yet.
+from the optimum, and it is worth a substantial factor in validation error.
 
 ## 9. The encoder is the reusable part
 
-Step back and look at what we built. The encoder holds essentially all of the
-learned physics — edge detectors, then charge-density texture discriminators,
-then track-versus-shower features — and about half the parameters. The decoder
-holds most of the rest, and it exists only to put the answer back on a full
-resolution grid. The classification and energy heads together are around **3 %**
-of the model.
-
-That asymmetry is the foundation of two things:
-
 - **Multi-task learning**, which we just did. Three supervision signals train one
   set of features, and the segmentation labels in particular are an enormously
-  richer signal than a single class label per event — 9216 labelled pixels
-  instead of one number.
+  richer signal than a single class label per event.
+  
 - **Transfer learning**, which is Notebook 4. If the encoder holds general
   features, you can train it once on abundant simulation and reuse it on the
   small, precious, hand-labelled sample you actually care about.

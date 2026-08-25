@@ -3,46 +3,37 @@
 
 **ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/drinkingkazu/a3net-lecture2/blob/main/notebooks/02_debugging_clinic.ipynb)
 ---
 
 ### Where we are
 
-Notebooks 0 and 1 were about **architecture**: choosing a hypothesis space that
-matches the structure of your data. This notebook is about the other half of the
-job, and it is the half you will actually spend your time on.
-
-Here is the uncomfortable truth about deep learning in practice. You will design
-a sensible architecture in an afternoon. You will then spend three weeks
+Here is the uncomfortable truth about deep learning in practice. We will design
+a sensible architecture in an afternoon. We will then spend three weeks
 discovering that it does not train, and the reason will almost never be the
 architecture. It will be a learning rate, a missing shuffle, a normalisation
 layer you left out of a network that turned out to be too deep to survive
 without it.
 
-Nobody teaches this, because it is not theory. It is diagnosis — and diagnosis is
-a skill you already have. You have spent years looking at a plot of a quantity
-against time and asking what physical process would produce that shape. That is
-exactly the skill required here. The only thing you are missing is knowing which
-quantities to plot and what the characteristic shapes mean.
+Nobody teaches this, because it is not theory. It is diagnosis (debugging), 
+something us researchers are trained well for: We have spent years looking at 
+a plot of a quantity against time and asking what physical process would produce that shape. That is exactly the skill required here. The only thing we are missing is knowing which quantities to plot and what the characteristic shapes mean.
 
 ### How this notebook works
 
 1. We build an **instrument panel**: the five quantities worth logging on every
    run, and what a healthy training curve looks like.
-2. You are then given **five patients** — five training runs that have gone
+2. You are then given **five patients**: five training runs that have gone
    wrong. You see only their curves. Diagnose each one before reading on.
 3. We reveal each diagnosis and apply the fix. The fixes are, between them, the
    entire practical toolkit: learning-rate schedules, optimiser choice,
    normalisation layers, residual connections, shuffling, augmentation, weight
    decay, early stopping.
-4. Twice we find that the textbook diagnosis is **wrong** on this data — once in
-   the clinic, once with a classic bug that refuses to reproduce — and work out
+4. Twice we find that the textbook diagnosis is **wrong** on this data and work out
    what is really going on. Knowing when a rule does *not* apply is worth more
    than the rule.
 5. We finish with the history: which trick appeared at which scale, and what
    problem it was invented to solve.
-
-You will get more out of this if you genuinely try to diagnose the five patients
-before scrolling. Write down your guesses.
 
 **Runtime:** roughly 20–25 minutes on a Colab T4 — the longest notebook in the
 set, because it trains a lot of small models. If you are short of time, §3 (the
@@ -52,7 +43,6 @@ clinic) is the part that matters.
 ## 0. Setup
 
 #%% setup
-
 #%% code
 train = ms.generate_dataset(3000, seed=0, progress=True)
 val   = ms.generate_dataset(1000, seed=1)
@@ -78,13 +68,6 @@ right thing. Log these five instead.
 | **gradient norm** $\lVert g \rVert$ | exploding (huge, spiky) or vanishing (many orders of magnitude too small) gradients |
 | **update ratio** $\lVert \Delta\theta \rVert / \lVert \theta \rVert$ | is the learning rate sane? Healthy is $\sim10^{-3}$ per step. $10^{-1}$ means you are destroying the model each step; $10^{-6}$ means nothing is happening |
 | **dead-unit fraction** | fraction of ReLU outputs that are exactly zero. Creeping towards 1 means units have died and will never recover |
-
-**Two resolutions.** The train-side quantities are computed on every step
-anyway, so we record them **twenty times per epoch**; the validation numbers
-need extra forward passes, so they stay at epoch boundaries. Both are plotted
-against epochs, so the x-axis reads the same. This matters more than it sounds:
-one of the patients below has structure *inside* each epoch that an epoch
-average erases completely.
 
 The **update ratio** deserves emphasis, because it is the single most useful
 number and almost nobody logs it. It is dimensionless and roughly
@@ -158,9 +141,7 @@ plot_runs([healthy], "reference: a training run that is working")
 #%% md
 Commit these shapes to memory:
 
-- **training loss** falls and keeps falling. At twenty samples per epoch it is
-  visibly jagged -- individual batches differ, and that scatter is normal. Read
-  the trend, not the wiggle;
+- **training loss** falls and keeps falling. At twenty samples per epoch it is visibly jagged and that scatter is normal. Read the trend, not the wiggle;
 - **validation loss** tracks it, a little above, and does not turn upward;
 - **gradient norm** is $O(1)$, decreasing gently, no spikes;
 - **update ratio** sits in the $10^{-3}$ band;
@@ -196,11 +177,17 @@ plot_runs(patients, "five patients — diagnose before reading on", figsize=(13,
 ### ↓ Diagnoses below. Stop here if you have not written yours down. ↓
 
 <br><br><br><br><br><br><br><br>
+<br><br><br><br><br><br><br><br>
 
-### Patient A — the learning rate is far too high
+### Wrote down your diagnosis? Please please please.
+
+<br><br><br><br><br><br><br><br>
+<br><br><br><br><br><br><br><br>
+
+### Patient A: the learning rate is far too high
 
 **Signature:** an enormous training loss in epoch 1 (ours is ~19), an update
-ratio near $1$ — the parameters change by ~100 % in a single epoch — and then,
+ratio near $1$ (i.e., the parameters change by ~100 % in a single epoch) and then,
 from epoch 2 onward, a loss pinned at $\ln 3 = 1.099$ with accuracy at exactly
 chance.
 
@@ -208,14 +195,14 @@ chance.
 gradient information is meaningless; the optimiser is bouncing around the loss
 surface at random. Within one epoch the model is wrecked, and it does not come
 back: every unit is saturated or dead, so the gradient is now genuinely tiny and
-the update ratio *collapses* to $10^{-4}$. That two-phase signature — a violent
-first epoch followed by a dead flat line — is characteristic.
+the update ratio *collapses* to $10^{-4}$. That two-phase signature (i.e., a violent
+first epoch followed by a dead flat line) is characteristic.
 
 $\ln(3) = 1.0986$ is the loss of a model outputting a uniform distribution over
 3 classes. Memorise the equivalent for your own problem: **a loss pinned at
 $\ln(\text{n classes})$ means your model has collapsed to predicting nothing.**
 
-Two warnings. First, the loss need not diverge to infinity — with adaptive
+Two warnings. First, the loss need not diverge to infinity: With adaptive
 optimisers it often just sits there looking flat, which is easy to confuse with
 patient B. Second, Adam is remarkably tolerant: at $\text{lr}=1.0$ this same
 network *recovers* and reaches 76 % accuracy, looking merely unstable rather than
@@ -224,24 +211,24 @@ broken. Being "nearly fine" is how a bad learning rate survives to production.
 **Fix:** lower it. And find out what "lower" should be, rather than guessing —
 next section.
 
-### Patient B — the learning rate is far too low
+### Patient B: the learning rate is far too low
 
 **Signature:** training loss decreases, but agonisingly slowly and perfectly
-smoothly — ours goes 2.98 → 1.58 over six epochs, and accuracy crawls from 0.33
-to 0.48. The update ratio is $\sim2\times10^{-5}$, two orders of magnitude below
+smoothly (ours goes 2.98 → 1.58 over six epochs, and accuracy crawls from 0.33
+to 0.48). The update ratio is $\sim2\times10^{-5}$, two orders of magnitude below
 healthy, and *flat*. Gradients are fine.
 
 **This is the one people misdiagnose**, because it looks like "the model cannot
-learn this task" — you conclude your architecture is wrong and start redesigning,
-when all you needed was a bigger number. The update ratio distinguishes A from B
+learn this task": we conclude our architecture is wrong and start redesigning,
+when all we needed was a bigger number. The update ratio distinguishes A from B
 instantly: A is far above the band, B is far below it, and both look like a flat
 accuracy curve.
 
 **Fix:** raise it. Same tool as A.
 
-### Patient C — too deep, with no normalisation and no residual connections
+### Patient C: too deep, with no normalisation and no residual connections
 
-**Signature:** training loss is stuck at $\ln 3$, like patient A — but the
+**Signature:** training loss is stuck at $\ln 3$, like patient A. But the
 gradient norm tells a completely different story, and the update ratio is tiny.
 Nothing is exploding; nothing is happening.
 
@@ -309,6 +296,42 @@ deep_fixes = [
     experiment("deep, +BN +res",  model=lambda: make_net(10, norm=True,  residual=True,  pool_every=3)),
 ]
 plot_runs(deep_fixes, "patient C: the fix", figsize=(13, 6.5))
+
+#%% code
+# Same question, asked of the networks we just TRAINED: is the gradient still
+# starved at the input end, or did training repair it? Init profiles are cheap
+# to recompute (one backward pass on a fresh model), so this cell stands alone.
+VARIANTS = [("plain", dict(norm=False, residual=False)),
+            ("+residual", dict(norm=False, residual=True)),
+            ("+BN", dict(norm=True, residual=False)),
+            ("+BN +res", dict(norm=True, residual=True))]
+
+profiles = {}
+for (label, kw), run in zip(VARIANTS, deep_fixes):
+    torch.manual_seed(0)
+    fresh = make_net(10, pool_every=3, **kw)
+    profiles[label] = (ms.layer_gradients(fresh, X, Y),          # at initialisation
+                       ms.layer_gradients(run["model"], X, Y))   # after training
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), sharey=True)
+for k, (when, title) in enumerate([(0, "at initialisation"), (1, "after training")]):
+    for (label, _), style in zip(VARIANTS, ["o-", "s-", "^-", "v-"]):
+        g = profiles[label][when]
+        axes[k].semilogy(range(1, len(g) + 1), g, style, ms=4, label=label)
+    axes[k].set_xlabel("conv layer index  (1 = closest to the input)")
+    axes[k].set_title(title, fontsize=10)
+    axes[k].grid(alpha=0.3, which="both")
+axes[0].set_ylabel("gradient norm")
+axes[0].legend(fontsize=8)
+fig.suptitle("gradient across depth: the shape is the diagnosis, not the height", y=1.02)
+plt.show()
+
+print(f"{'variant':<12}{'init last/first':>17}{'end last/first':>17}{'final acc':>11}")
+print("-" * 57)
+for (label, _), run in zip(VARIANTS, deep_fixes):
+    gi, gf = profiles[label]
+    print(f"{label:<12}{gi[-1] / gi[0]:>17.1e}{gf[-1] / gf[0]:>17.1e}"
+          f"{run['val_acc'][-1]:>11.3f}")
 
 #%% md
 **Any one of them rescues the network.** Residual connections alone take it from

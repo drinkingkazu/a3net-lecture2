@@ -3,21 +3,34 @@
 
 **ML Summer School · Large models: CNNs, GNNs, and deep learning applications**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/drinkingkazu/a3net-lecture2/blob/main/notebooks/00_data_and_representations.ipynb)
+
+
 ---
 
-### Where we are
+#%% md
+### Setup
 
-The previous lecture gave you linear models and the statistical-learning frame:
-a hypothesis space, a loss, an optimiser, and a bias–variance trade-off. It also
-gave you an unsettling theorem — the **universal approximation theorem** — which
-says a sufficiently wide multi-layer perceptron (MLP) can approximate any
-continuous function to any accuracy you like.
+The cell below clones the course repository and installs it. Run it once per
+session; it is safe to re-run and does nothing if `mlschool` module is already
+available. 
 
-Read literally, that theorem ends this lecture before it starts. If an MLP can
-represent anything, why does anyone build a convolutional network?
+#%% setup
+import mlschool as ms
+deck = ms.slides.SlideDeck("slides/NB0/intro")
+deck.show(start=0)
 
-The answer is the single most important idea in this lecture, so here it is up
-front:
+#%% md
+## Where we are
+
+The previous lecture gave us statistical-learning foundations:
+a hypothesis space, a loss, an optimizer, and multi-layer perceptrons (MLP)
+along with the **universal approximation theorem** which says a sufficiently 
+wide multi-layer perceptron (MLP) can approximate any continuous function.
+
+**So, why do we need anything else?**
+
+The answer is the core of this lecture:
 
 > **Representability is not the problem. Optimisability is.**
 >
@@ -31,64 +44,42 @@ front:
 > space to one that mostly contains sensible answers. That shrinking is called
 > an **inductive bias**.
 
-This notebook establishes that claim experimentally, and introduces the dataset
-we will use for the entire lecture.
+### What we will do
 
-### What you will do
-
-1. Meet the data: simulated particle interactions in a liquid-argon detector.
-2. Practise **Rule 0** — look at your data and count things — before modelling.
-3. Count parameters, and see why "just use a big MLP" is not a plan.
-4. Run the headline experiment: an MLP with 2.4 M parameters against a CNN with
-   16 k, on a task designed so that *only shape* can solve it.
-5. Watch the CNN's translation invariance break down at the image border — the
-   opening for Lecture 4.
-6. See the same event as a **dense image**, a **sparse coordinate list**, and a
-   **point cloud**, and count the cost of each.
+1. Meet the data.
+2. Practice **Rule 0**: look at data before modelling.
+3. Quiz: parameter counts of an MLP and CNN.
+4. MLP (2.4M) vs. CNN (16k) on a task designed so that *only shape* can solve it.
+5. Incomplete symmetry: where CNNs break down.
+6. Data format and trade-offs: **dense** vs. **sparse** images and **point cloud**.
 
 **Runtime:** roughly 5–8 minutes on a Colab T4. Set *Runtime → Change runtime
 type → GPU* before you start; it will still run on CPU, just slower.
 
 #%% md
-## 0. Setup
-
-The cell below clones the course repository and installs it. Run it once per
-session; it is safe to re-run and does nothing if `mlschool` is already
-available. Everything the notebooks share — the detector simulator, plotting,
-metrics and training boilerplate — lives in that package, so the code you read
-below is only the code that carries an idea.
-
-#%% setup
-
-#%% md
 ## 1. The detector and the data
 
-Our data is a cartoon of a **liquid-argon time projection chamber** (LArTPC) —
-the detector technology behind MicroBooNE, ICARUS, and the forthcoming DUNE.
-A charged particle traversing the argon ionises it; the ionisation charge drifts
-to a readout plane and is recorded. What you get out is, to a good
-approximation, a **picture of the event**.
+Our data is a cartoon of a **liquid-argon time projection chamber** (LArTPC),
+a widely used technology in neutrino physics. It captures a trajectory of 
+charged particles through detection of deposited energy.
 
-Two signatures dominate, and telling them apart is a real and central task in
-neutrino physics:
+Two signatures dominate:
 
 | | appearance | physics |
 |---|---|---|
 | **track** | thin, continuous, roughly constant charge per unit length, with a sharp **Bragg peak** where the particle stops | muons, protons, charged pions |
 | **shower** | a cone that starts at the interaction vertex and widens with depth; diffuse and stochastic | electrons and photons initiating an electromagnetic cascade |
 
-On top of that sits a sprinkling of uncorrelated **noise hits**, which are not
-signal and must be ignored.
+On top of that sits a sprinkling of uncorrelated **noise hits**.
 
-We simulate three event classes — *track only*, *shower only*, and
-*track + shower* (the topology of an electron-neutrino charged-current
-interaction) — and provide three labels per event:
+We simulate three event classes: *track only*, *shower only*, and
+*track + shower*, and provide three labels per event:
 
 - `label` — the event class (3-way classification)
 - `seg` — a **per-pixel** semantic label: background / track / shower (segmentation)
 - `energy` — total true deposited charge (regression)
 
-One dataset, three tasks, one shared encoder. That is the structure of Notebook 1.
+One dataset, three tasks.
 
 #%% code
 t0 = time.time()
@@ -100,28 +91,29 @@ fig = ms.plot_grid(events, idx=[int(np.where(events["label"] == c)[0][k])
 plt.show()
 
 #%% md
-Top row: the charge image, which is what the detector gives you. Bottom row: the
-per-pixel truth labels, which only simulation gives you. Note the bright pixel at
-the end of each track — that is the Bragg peak, and it is a genuine physical
-handle on where a particle stopped.
+Top row: the charge image (model input). Note the bright pixel at
+the end of each track (Bragg peak). Bottom row: per-piexel semantic labels. 
 
-## 2. Rule 0: look at your data, and count things
+## 2. Rule 0: look at data before modeling
 
-Before you choose an architecture, before you write a training loop, before you
-do anything at all: **print the numbers**. Every hour of the debugging that
-awaits you in Notebook 2 is an hour you could have saved here.
+ML frameworks are so easy to use that in many cases we start training before
+understanding or even looking at data. Every expert knows and still makes this
+mistake repeatdly. 
 
-The four numbers that matter most:
+Training without understanding data is almost as bad as garbage-in-garbage-out.
 
-1. **Dynamic range of the inputs.** Neural networks are badly behaved when fed
-   inputs of order 100. You will normalise these — and in Notebook 2 you will
-   see exactly what happens when you forget.
-2. **Occupancy.** What fraction of pixels are non-zero? This single number
-   decides whether a dense convolution is a sensible use of your GPU.
-3. **Class balance**, at both the event and the pixel level. A task where 98 %
-   of the answers are "background" has a trivial degenerate optimum that your
-   loss function will happily find.
-4. **Memory.** How big is one batch, really?
+Look at the data and understand it. Skipping this can turn into days of debugging
+uninteresting causes.
+
+The minimum four numbers:
+
+1. **Dynamic range of the inputs**: a rule-of-the-thumb for neural nets is to keep the value range _O_(1).
+    - We may have to _normalize_ the inputs (more on notebook 2)
+2. **Occupancy**: What fraction of pixels are non-zero?
+    - This single number decides whether a dense convolution is a sensible use of your GPU.
+3. **Class balance**: how many samples per class are there in the training dataset?
+    - A task where 98 % of the answers are "background" has a trivial degenerate optimum that your loss function will happily find.
+4. **Memory**: How big is one batch? How much memory does my network need?
 
 #%% code
 ms.summarize(events, "3-class dataset")
@@ -129,66 +121,44 @@ ms.summarize(events, "3-class dataset")
 #%% md
 Three of those numbers should stop you:
 
-- **Charge runs from 0 to ~140.** Feed that straight into a network with
-  standard initialisation and the first layer's pre-activations will be enormous.
-- **Occupancy is ~2.5 %.** A dense convolution over this image spends about
-  **97.5 % of its arithmetic multiplying zeros by weights.** Hold on to that
-  number; it is the entire motivation for Notebook 3.
-- **Pixel classes are ~98 % background.** A segmentation model that predicts
-  "background" everywhere achieves 98 % pixel accuracy and is completely
-  useless. This is why *accuracy* is the wrong metric and why the choice of loss
-  is a modelling decision, not a formality — Notebook 1.
+- **Charge runs from 0 to ~120.**
+    - That would cause the first layer's pre-activations will be enormous.
+- **Occupancy is ~2.5 %.**
+    - A naive NN may spend **97.5 % of compute multiplying zeros.** A motivation for Notebook 3.
+- **Pixel classes are ~98 % background.**
+    - A segmentation model achieves 98 % pixel accuracy esily by predicting all pixels as backgrounds.
 
-## 3. Why not just use a big MLP?
-
-Let us take the universal approximation theorem at its word and price it out.
-
-An MLP takes the image as a flat vector of $96 \times 96 = 9216$ numbers. Its
-first layer has one weight per (input pixel, hidden unit) pair. A convolutional
-layer instead **shares** one small kernel across every position in the image.
+## 3. Convolutional Neural Network (CNN):
+---
 
 #%% code
-H = W = ms.SIZE
-n_pixels = H * W
-
-mlp_first  = n_pixels * 256 + 256          # Linear(9216 -> 256)
-conv_first = 1 * 16 * 3 * 3 + 16           # Conv2d(1 -> 16, kernel 3x3)
-
-print(f"image                        {H} x {W} = {n_pixels} pixels")
-print(f"MLP  first layer (-> 256)    {mlp_first:>12,} parameters")
-print(f"Conv first layer (1->16, 3x3){conv_first:>12,} parameters")
-print(f"ratio                        {mlp_first / conv_first:>12,.0f} x")
-print()
-print("and if the detector doubles in linear size:")
-for size in (96, 192, 384, 768):
-    print(f"  {size:>4} x {size:<4}  MLP first layer = {size * size * 256 + 256:>12,}"
-          f"   conv kernel = {conv_first:>6,}")
+import mlschool as ms
+deck = ms.slides.SlideDeck("slides/NB0/cnn")
+deck.show(start=0)
 
 #%% md
-The conv kernel's parameter count **does not depend on the image size at all**.
-The MLP's grows quadratically. For a real DUNE readout plane the MLP first layer
-alone would have billions of parameters.
+### Exercise: counting the number of parameters
 
-But parameter count is the *shallow* version of the argument, and if you stop
-there a student will reasonably reply: "fine, so it's expensive — buy more
-GPUs." The deep version of the argument is about what those parameters
-*generalise to*, and that needs an experiment.
+1. Consider a MLP for a binary classification. An input image has the size 96x96 pixels. The model consists of three layers (one hidden layer): the first two layers contain 256 and 128 neurons respectively, and the final layer for a binary classification.
+    - What is the shape of a tensor after the first layer?
+    - How many parameters are there in the model?
+    - How does the number of parameters change for an input of 192x192 pixels? What about 384x384?
+2. Consider a CNN that consists of two convolution layers, 3x3 kernel, 1 pixel padding, 1 pixel stride, and 16 neurons per layer. Convolution layers are followed by a max-pooling layer before the linear layer that performs a binary classification.
+    - What is the shape of a tensor after the first convolution layer?
+    - How many parameters are there in the model?
+    - How does the number of parameters change for an input of 192x192 pixels?
+    - What is the shape of a tensor after the second convolution layer?
 
-## 4. Designing an experiment that measures the right thing
+#%% md
 
-We want to ask: *does an MLP learn the shape of an event, or does it learn where
-the bright pixels happen to be?*
+## 4. MLP vs. CNN
 
-The obvious experiment is to train on events near the image centre and test on
-events shifted away from it. But run that on our 3-class dataset and we would be
-fooling ourselves. Look again at the summary above: a shower deposits far more
-charge over far more pixels than a track. So **total charge alone nearly gives
-the class away** — and total charge is translation invariant. A model could
-score beautifully on shifted images having learned nothing whatsoever about
-shape, and we would draw exactly the wrong conclusion.
+Let's train two models and analyze the differences.
+To put an emphasis on the subject, let's carefully setup the problem first.
 
-This is an ordinary experimental-design problem and you already know how to
-handle it: **remove the confound by construction.**
+We would like to see the translation invariance of CNN a classification metric.
+If this classification can be done without locality, then it would not be a meaningful comparison.
+An example is track vs. shower classification where the latter comes with a larger charge and pixel count, which the network may key on ignoring any locality information.
 
 So for this one experiment we use a controlled sample from the same simulator:
 
@@ -197,12 +167,9 @@ So for this one experiment we use a controlled sample from the same simulator:
 
 Both classes are built with the same total track length, the same charge per unit
 length, and the centre of charge placed at the same distribution of positions.
-We also switch off the Bragg peak, because a two-armed event would otherwise have
-two bright endpoints and a one-armed event one — another position-free giveaway.
+We also switch off the Bragg peak to avoid cheating through using a simple image-level thresholding.
 
-Hit count and total charge therefore carry no class information. The only usable
-signal is **shape**. Physically the task is a fair one: distinguishing a muon
-that passed through from one that scattered hard or decayed in flight.
+The total, max, mean hit count and charge therefore carry no class information.
 
 #%% code
 kink_train = ms.generate_kink_dataset(6000, seed=1, jitter=6)    # centred events
@@ -224,40 +191,22 @@ fig.tight_layout(); plt.show()
 
 #%% md
 Now verify the confound is actually gone, rather than assuming it. We fit a
-logistic regression on nothing but global, position-free summary statistics — if
-*that* can classify the events, our experiment is worthless.
+logistic regression on nothing but global, position-free summary statistics.
 
 #%% code
 _ = ms.check_shortcuts(kink_train)
 
 #%% md
-Around 0.53 against a chance level of 0.50. Essentially nothing. Good — any model
-that does well here has to be using shape.
+Well confused!
 
 > **Habit worth forming.** Every time you build a discrimination task, ask what
-> the dumbest possible cheat is, and *measure* whether it works. In physics the
-> cheat is usually a difference in event rate, exposure, or preprocessing between
-> your two samples, and it will happily produce a beautiful, meaningless ROC curve.
+> the dumbest possible cheat is, and *measure* whether it works.
 
-## 5. Two models
-
-**The MLP** flattens the image and learns a weight for every pixel. Nothing in
-its structure says that pixel $(40, 40)$ and pixel $(41, 40)$ are neighbours; you
-could permute all 9216 pixels with a fixed random permutation and the MLP would
-train exactly as well. It does not know the image is an image.
-
-**The CNN** makes two structural assumptions, and they are assumptions about
-*physics*, not about software:
-
-1. **Locality** — what matters at a point is decided by its neighbourhood. True
-   here: ionisation is deposited locally.
-2. **Translation equivariance (weight sharing)** — a kink is a kink wherever it
-   occurs. Also true here: the detector response does not depend on where in the
-   volume the interaction happened.
+### Building + Training 
 
 We then finish the CNN with a **global max-pool**, which turns equivariance
 ("where is the kink?") into invariance ("is there a kink at all?"). Note *max*,
-not *mean* — we come back to that choice below, and it matters more than you
+not *mean*. We come back to that choice below, and it matters more than you
 would guess.
 
 #%% code
@@ -409,8 +358,7 @@ looks like. It learned which pixels tend to be lit in a kink event *near the
 centre of the image*, which is a completely different function that happens to
 agree with the right answer on the training distribution.
 
-The CNN barely notices. Not because it is bigger — it is 150× smaller — and not
-because it was trained better. Because *the function it cannot express* is
+The CNN barely notices. Because *the function it cannot express* is
 "a kink at the centre is different from a kink in the corner." Weight sharing
 makes that hypothesis unavailable. The inductive bias did not help the CNN find
 a better solution inside a large space; it **deleted the wrong answers from the
@@ -422,7 +370,7 @@ space**.
 ### Degradation curve
 
 A single shifted test set gives one number. Sweep the shift and you get the
-whole story — including the part that is *not* flattering to the CNN.
+whole story, including the part that is *not* flattering to the CNN.
 
 #%% code
 jitters = [0, 6, 12, 18, 24, 30, 36, 42]
@@ -447,17 +395,10 @@ plt.show()
 #%% md
 Two things to read off this plot.
 
-**The MLP falls off a cliff at the edge of its training distribution.** This is
-not a subtle generalisation gap; it is a model doing something categorically
-different from what you thought it was doing. If you had validated only on
-centred events — as people routinely do, because the validation set is a random
-split of the training set — you would have shipped this model believing it was
-94 % accurate.
+**The MLP falls off a cliff at the edge of its training distribution.** 
 
 **The CNN is flat all the way across.** It generalises perfectly to a region of
-the detector it never saw during training, with 150× fewer parameters, because
-weight sharing means "somewhere it has not seen" is not a meaningful concept for
-it.
+the detector it never saw during training, with 150× fewer parameters.
 
 ### But the invariance is not exact
 
@@ -467,8 +408,7 @@ not, and the difference matters enough that a whole lecture is built on it.
 Accuracy is a blunt instrument: our decision margin is large, so small
 perturbations to the network's output never flip a prediction and never show up
 as a change in accuracy. So measure the **output itself**. We shift each test
-image by $s$ pixels — cyclically, so nothing is clipped and nothing leaves the
-image — and record how much the classification margin moves. A truly invariant
+image by $s$ pixels and record how much the classification margin moves. A truly invariant
 function would give exactly zero for every $s$.
 
 #%% code
@@ -513,16 +453,14 @@ ax.legend(); ax.grid(alpha=0.3, axis="y")
 plt.show()
 
 #%% md
-The output changes — and it changes with a clear **odd/even structure**: a shift
+The output changes with a clear **odd/even structure**: a shift
 by an odd number of pixels perturbs the margin roughly five times more than a
 shift by an even number.
 
 That pattern is a fingerprint. Our network contains two `MaxPool2d(2)` layers, so
 the feature map is subsampled on a stride-2 grid. Shifting the input by an even
 number of pixels moves features to a position the grid can still represent;
-shifting by an odd number does not, and a different pixel wins the pooling
-window. The network is exactly equivariant to the shifts that survive
-subsampling and only approximately equivariant to the rest. This is **aliasing**,
+shifting by an odd number does not. This is **aliasing**,
 in precisely the signal-processing sense you already know.
 
 Two further leaks, which this cyclic-shift test deliberately excludes:
@@ -530,21 +468,17 @@ Two further leaks, which this cyclic-shift test deliberately excludes:
 - **Borders.** Real images end. An event straddling the edge is simply cut off.
 - **Zero padding.** `padding=1` means the convolution sees a fictitious ring of
   zeros, so a kernel near the boundary computes something different from the same
-  kernel in the interior. The network can and does exploit this to infer absolute
-  position — which is exactly the inductive bias we were trying to remove.
+  kernel in the interior.
 
 So the honest statement is: **a CNN is approximately translation equivariant in
-the interior of the image, up to aliasing from subsampling.** For most work that
-approximation is good enough, and this plot shows why — the violation is ~7 % of
-the margin scale and never flips a prediction.
+the interior of the image, up to aliasing from subsampling.** 
 
-But "good enough" is not always good enough. When the symmetry is exact physics —
-rotations of a detector, permutations of identical particles, the Euclidean group
-acting on a 3D point cloud — you can build the symmetry into the *mathematics of
+For most work that approximation is good enough, but "good enough" is not always good enough. 
+When the symmetry is exact physics (rotations of a detector, permutations of identical particles, the Euclidean group acting on a 3D point cloud), you can build the symmetry into the *mathematics of
 the layer* instead of hoping your training data covers every orientation.
 **That is Lecture 4.** The bars above are the reason it exists.
 
-## 6. An aside worth two minutes: max or mean?
+### Pooling: max or mean?
 
 We ended the CNN with global **max**-pooling. The other obvious choice is global
 **average**-pooling, which is what most textbook image classifiers use. Try it.
@@ -563,16 +497,15 @@ The average-pooled network does not learn the task at all.
 The reason is our occupancy number from Section 2. The interesting feature — a
 kink — occupies a handful of positions out of the $24 \times 24 = 576$ in the
 final feature map. Averaging over all of them dilutes that signal by two orders
-of magnitude and buries it in whatever the network outputs on empty space. Max
-pooling asks "did this detector fire *anywhere*?", which is precisely the
-question a sparse-signal problem poses.
+of magnitude. Max pooling asks "did this detector fire *anywhere*?", which is 
+precisely the question a sparse-signal problem poses.
 
 ImageNet pictures are dense: every pixel belongs to something, and averaging is
 sensible. Detector images are not. **Design choices imported from computer
 vision carry assumptions about natural images, and those assumptions are
 frequently false for physics data.** Check them.
 
-## 7. The same event in three representations
+## 6. The same event in three representations
 
 We have been treating the event as a dense $96 \times 96$ array because that is
 convenient for a convolution. But it is a strange choice for data that is 97.5 %
@@ -654,7 +587,7 @@ Two responses exist, and we will build both in Notebook 3:
   confront a different symmetry: the points come in no particular order, so your
   model had better be **permutation invariant**.
 
-## 8. Takeaways
+## 7. Takeaways
 
 1. **Universal approximation is a statement about existence, not about
    optimisation.** The MLP could represent the right function. It found a
@@ -676,7 +609,7 @@ Two responses exist, and we will build both in Notebook 3:
    aliasing introduced by subsampling, and it leaks further at borders and
    through zero padding. Lecture 4 is about making it exact.
 
-## 9. Exercises
+## 8. Exercises
 
 Try these while the lecture moves on; none takes more than a few minutes.
 
